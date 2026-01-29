@@ -263,7 +263,7 @@ class MarketMaker:
     def get_rebalance_settings(self):
         """
         獲取當前重平設置
-        
+
         Returns:
             dict: 重平設置信息
         """
@@ -273,7 +273,78 @@ class MarketMaker:
             'quote_asset_target_percentage': self.quote_asset_target_percentage,
             'rebalance_threshold': self.rebalance_threshold
         }
-    
+
+    def get_status_summary(self):
+        """
+        Returns dict with all status information for Telegram
+
+        Returns:
+            dict: Status summary including strategy, balances, trades, profit
+        """
+        return {
+            'strategy_type': 'market_maker',
+            'symbol': self.symbol,
+            'exchange': self.exchange,
+            'runtime': datetime.now() - self.session_start_time,
+            'balances': self.get_total_balance(),
+            'active_orders': {
+                'buy': len(self.active_buy_orders),
+                'sell': len(self.active_sell_orders)
+            },
+            'trading_stats': {
+                'total_bought': self.total_bought,
+                'total_sold': self.total_sold,
+                'maker_buy_volume': self.maker_buy_volume,
+                'maker_sell_volume': self.maker_sell_volume,
+                'taker_buy_volume': self.taker_buy_volume,
+                'taker_sell_volume': self.taker_sell_volume,
+                'total_quote_volume': self.total_quote_volume,
+            },
+            'profit': {
+                'total': self.total_profit,
+                'session': self._calculate_session_profit(),
+                'fees': self.total_fees
+            },
+            'quote_asset': self.quote_asset,
+            'base_asset': self.base_asset,
+            'state': self._get_state()
+        }
+
+    def _get_state(self):
+        """
+        Returns current bot state: RUNNING, PAUSED, or STOPPED
+        """
+        if getattr(self, '_stop_flag', False):
+            return 'STOPPED'
+        if getattr(self, '_paused', False):
+            return 'PAUSED'
+        return 'RUNNING'
+
+    def pause_trading(self):
+        """
+        Pause trading - cancel orders, keep bot running
+        """
+        self._paused = True
+        self.cancel_existing_orders()
+        logger.info("Trading paused via Telegram command")
+
+    def resume_trading(self):
+        """
+        Resume from paused state
+        """
+        self._paused = False
+        logger.info("Trading resumed via Telegram command")
+
+    def stop_trading_gracefully(self):
+        """
+        Graceful shutdown - cancel orders, save stats, cleanup
+        """
+        self._stop_flag = True
+        self.cancel_existing_orders()
+        if self.ws:
+            self.ws.close()
+        logger.info("Trading stopped gracefully via Telegram command")
+
     def get_total_balance(self):
         """獲取總餘額，包含普通餘額和抵押品餘額"""
         try:

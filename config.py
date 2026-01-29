@@ -18,6 +18,11 @@ HTTPS_PROXY = os.getenv('HTTPS_PROXY')
 DB_PATH = os.getenv('DB_PATH', 'orders.db')
 ENABLE_DATABASE = os.getenv('ENABLE_DATABASE', '0').strip().lower() in {"1", "true", "yes", "on"}
 
+TELEGRAM_ENABLED = os.getenv('TELEGRAM_ENABLED', '0').strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+TELEGRAM_UPDATE_INTERVAL = int(os.getenv('TELEGRAM_UPDATE_INTERVAL', '30'))
+
 # 日誌配置
 LOG_FILE = os.getenv('LOG_FILE', 'market_maker.log')
 

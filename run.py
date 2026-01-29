@@ -8,7 +8,7 @@ import sys
 import os
 import traceback
 from typing import Optional
-from config import ENABLE_DATABASE
+from config import ENABLE_DATABASE, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED, TELEGRAM_UPDATE_INTERVAL
 from logger import setup_logger
 
 # 創建記錄器
@@ -63,6 +63,8 @@ def parse_arguments():
     parser.add_argument('--base-asset-target', type=float, help='基礎資產目標比例 (0-100, 默認: 30)')
     parser.add_argument('--rebalance-threshold', type=float, help='重平觸發閾值 (>0, 默認: 15)')
 
+    parser.add_argument('--enable-telegram', action='store_true', help='啟動Telegram Bot整合')
+
     return parser.parse_args()
 
 def validate_rebalance_args(args):
@@ -85,6 +87,7 @@ def validate_rebalance_args(args):
 
 def main():
     """主函數"""
+    global telegram_bot
     args = parse_arguments()
     
     # 驗證重平參數
@@ -389,12 +392,30 @@ def main():
                         exchange_config=exchange_config,
                         enable_database=args.enable_db
                     )
-            
+
+            telegram_bot = None
+            if args.enable_telegram and TELEGRAM_ENABLED:
+                if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+                    logger.error("Telegram bot token or chat ID not configured...")
+                    sys.exit(1)
+
+                from telegram_bot import TelegramBot
+                telegram_bot = TelegramBot(
+                    token=TELEGRAM_BOT_TOKEN,
+                    chat_id=int(TELEGRAM_CHAT_ID),
+                    trading_bot_instance=market_maker,
+                    update_interval_minutes=TELEGRAM_UPDATE_INTERVAL
+                )
+                telegram_bot.start()
+                logger.info("Telegram bot started")
+
             # 執行做市策略
             market_maker.run(duration_seconds=args.duration, interval_seconds=args.interval)
             
         except KeyboardInterrupt:
             logger.info("收到中斷信號，正在退出...")
+            if telegram_bot:
+                telegram_bot.stop()
         except Exception as e:
             logger.error(f"做市過程中發生錯誤: {e}")
             import traceback

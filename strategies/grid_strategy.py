@@ -909,6 +909,29 @@ class GridStrategy(MarketMaker):
 
         return sections
 
+    def get_status_summary(self):
+        """
+        Override parent method to add grid-specific statistics
+
+        Returns:
+            dict: Status summary including grid stats
+        """
+        base_summary = super().get_status_summary()
+        base_summary.update({
+            'strategy_type': 'grid_trading',
+            'grid_stats': {
+                'grid_levels': len(self.grid_levels),
+                'price_range': f"{self.grid_lower_price:.4f} ~ {self.grid_upper_price:.4f}",
+                'grid_mode': self.grid_mode,
+                'buy_fills': self.grid_buy_filled_count,
+                'sell_fills': self.grid_sell_filled_count,
+                'grid_profit': self.grid_profit,
+                'active_buy_orders': sum(len(orders) for orders in self.grid_buy_orders_by_price.values()),
+                'active_sell_orders': sum(len(orders) for orders in self.grid_sell_orders_by_price.values()),
+            }
+        })
+        return base_summary
+
     def run(self, duration_seconds=3600, interval_seconds=60):
         """運行網格交易策略"""
         logger.info("開始運行網格交易策略: %s", self.symbol)

@@ -9,3 +9,4 @@ flask-socketio
 python-socketio
 werkzeug
 apexomni
+python-telegram-bot>=20.0
