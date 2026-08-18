@@ -11,3 +11,4 @@ werkzeug
 apexomni
 python-telegram-bot>=20.0
 hyperliquid-python-sdk==0.24.0
+textual>=1.0,<2.0

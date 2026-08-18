@@ -16,6 +16,9 @@ def setup_logger(name="market_maker"):
         return logger
         
     logger.setLevel(logging.INFO)
+    # Each project logger owns its handlers.  Prevent messages from being
+    # emitted a second time when another library configures the root logger.
+    logger.propagate = False
     
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     

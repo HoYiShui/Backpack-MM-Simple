@@ -139,6 +139,7 @@ class PerpGridStrategy(PerpetualMarketMaker):
         # 統計
         self.grid_long_filled_count = 0
         self.grid_short_filled_count = 0
+        self.grid_completed_count = 0
         self.grid_profit = 0.0
 
         # 訂單ID別名：clientOrderIndex 與交易所 order_id 對應
@@ -852,6 +853,7 @@ class PerpGridStrategy(PerpetualMarketMaker):
         logger.info("網格利潤實現: %.4f %s (累計: %.4f)", grid_profit, self.quote_asset, self.grid_profit)
 
         if is_fully_filled:
+            self.grid_completed_count = getattr(self, 'grid_completed_count', 0) + 1
             self._remove_close_order(normalized_id)
         else:
             logger.info("平倉單部分成交，保留剩餘數量 %.8f", original_qty - close_info['filled_quantity'])

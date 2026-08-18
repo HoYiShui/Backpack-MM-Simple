@@ -205,7 +205,7 @@ WEB_DEBUG=false
 
 Hyperliquid 目前只開放 Testnet 永續網格，Mainnet 在代碼中默認禁用。配置、風控、運行命令與驗收證據格式見 [Hyperliquid Testnet 指南](docs/HYPERLIQUID_TESTNET.md)。
 
-本程序提供三種運行模式，您可以根據需求選擇：
+本程序提供四種運行模式，您可以根據需求選擇：
 
 ### 運行模式説明
 
@@ -213,6 +213,7 @@ Hyperliquid 目前只開放 Testnet 永續網格，Mainnet 在代碼中默認禁
 |------|------|---------|------|
 | **Web 控制枱** | `python run.py --web` | 可視化操作和監控 | 圖形界面、實時數據、易於上手 |
 | **命令行界面 (CLI)** | `python run.py --cli` | 交互式配置 | 菜單導航、逐步配置、適合測試 |
+| **終端儀表盤 (TUI)** | `python run.py [策略參數] --tui` | 實時監控直接啟動的策略 | 固定刷新、文件日志、安全退出 |
 | **快速啟動** | `python run.py [參數]` | 自動化運行 | 直接啟動、適合腳本化部署 |
 
 > **推薦順序**：新手建議先用 Web 控制枱熟悉功能 → CLI 測試參數 → 快速啟動自動化運行

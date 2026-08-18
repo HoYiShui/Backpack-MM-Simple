@@ -26,6 +26,7 @@ def parse_arguments():
     # 模式選擇
     parser.add_argument('--cli', action='store_true', help='啟動命令行界面')
     parser.add_argument('--web', action='store_true', help='啟動Web界面')
+    parser.add_argument('--tui', action='store_true', help='以 Textual 儀表盤顯示策略狀態')
     
     # 基本參數
     parser.add_argument('--exchange', type=str, choices=['backpack', 'aster', 'paradex', 'lighter', LIGHTER_ROBINHOOD_EXCHANGE, 'apex', 'standx', 'hyperliquid'], default='backpack', help='交易所選擇')
@@ -96,6 +97,20 @@ def main():
     """主函數"""
     global telegram_bot
     args = parse_arguments()
+
+    selected_interfaces = sum(bool(value) for value in (args.cli, args.web, args.tui))
+    if selected_interfaces > 1:
+        logger.error("--cli、--web 和 --tui 不能同時使用")
+        sys.exit(1)
+    if args.tui and not sys.stdout.isatty():
+        logger.error("--tui 需要互動式終端；非 TTY 環境請移除 --tui")
+        sys.exit(1)
+    if args.tui:
+        try:
+            from tui import run_tui
+        except ImportError as exc:
+            logger.error("啟動 TUI 失敗: %s；請重新安裝 requirements.txt", exc)
+            sys.exit(1)
     
     # 驗證重平參數
     validate_rebalance_args(args)
@@ -192,8 +207,6 @@ def main():
             'ws_url': os.getenv('HYPERLIQUID_WS_URL', 'wss://api.hyperliquid-testnet.xyz/ws'),
             'allow_orders': bool(args.confirm_live_testnet),
             'allow_mainnet': False,
-            'max_order_notional': os.getenv('HYPERLIQUID_MAX_ORDER_NOTIONAL', '100'),
-            'max_active_orders': int(os.getenv('HYPERLIQUID_MAX_ACTIVE_ORDERS', '30')),
             'max_position': args.max_position,
             'close_on_exit': bool(args.close_on_exit),
         }
@@ -454,8 +467,15 @@ def main():
                 telegram_bot.start()
                 logger.info("Telegram bot started")
 
-            # 執行做市策略
-            market_maker.run(duration_seconds=args.duration, interval_seconds=args.interval)
+            # 執行做市策略。TUI 只負責呈現狀態；策略仍走原本的 run/cleanup 流程。
+            if args.tui:
+                run_tui(
+                    market_maker,
+                    duration_seconds=args.duration,
+                    interval_seconds=args.interval,
+                )
+            else:
+                market_maker.run(duration_seconds=args.duration, interval_seconds=args.interval)
             
         except KeyboardInterrupt:
             logger.info("收到中斷信號，正在退出...")

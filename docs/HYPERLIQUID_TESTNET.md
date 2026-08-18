@@ -7,7 +7,7 @@
 - 默認只接受 `https://api.hyperliquid-testnet.xyz`，Mainnet 未提供 CLI 解鎖入口。
 - 沒有 `--confirm-live-testnet` 時拒絕一切下單與撤單。
 - 每張 bot 訂單使用 16-byte `cloid`，固定前綴為 `0x42504d47`；撤單與退出清理只管理此前綴，手工訂單不在清理範圍。
-- 每单至少满足 Hyperliquid 的 10 USDC 名义金额，并受 `HYPERLIQUID_MAX_ORDER_NOTIONAL`、`HYPERLIQUID_MAX_ACTIVE_ORDERS` 和 `--max-position` 三层本地上限约束。
+- 本地不限制单笔名义金额或活跃订单数量，由 HyperCore 的订单、保证金与用户额度规则约束。`--max-position` 仍作为用户显式配置的策略敞口上限。
 - 风控计算包含实际净仓位、所有未成交开仓单以及即将批量提交的订单。
 - 平仓腿在 Hyperliquid 上始终为 `reduce-only`；`--close-on-exit` 会先撤 bot 订单，再按实际净仓位执行 reduce-only 市价平仓。
 - REST 成交对账按累计成交量补差额；请求失败时保持未决，不把网络错误当作成交或撤单。
@@ -45,6 +45,14 @@ python -m venv .venv
   --interval 5 \
   --disable-db
 ```
+
+在同一條命令末尾加入 `--tui` 可啟用只讀 Textual 儀表盤。策略參數、下單流程和退出清理均不改變；普通運行日志仍寫入配置的日志文件，終端只顯示實時狀態。按 `Ctrl+C` 或 `q` 後，界面會等待撤單、可選平倉及 WebSocket 清理完成再退出。
+
+```bash
+.venv/bin/python run.py [原有策略參數] --tui
+```
+
+`--tui` 需要互動式終端，不適用於把 stdout 重定向到文件的後台任務。
 
 ## 验收
 

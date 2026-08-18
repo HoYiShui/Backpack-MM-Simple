@@ -125,7 +125,6 @@ def client():
                 "signer_private_key": TEST_KEY,
                 "base_url": "https://api.hyperliquid-testnet.xyz",
                 "allow_orders": True,
-                "max_order_notional": "1000",
             }
         )
 
@@ -201,6 +200,20 @@ def test_reduce_only_full_close_can_be_below_minimum_notional(client):
     assert "最低要求" in opening.error_message
 
 
+def test_large_notional_order_has_no_local_cap(client):
+    response = client.execute_order(
+        {
+            "symbol": "BTC",
+            "side": "Bid",
+            "quantity": "0.01",
+            "price": "32000",
+            "orderType": "Limit",
+        }
+    )
+
+    assert response.success
+
+
 def test_batch_preserves_partial_success(client):
     response = client.execute_order_batch(
         [
@@ -211,6 +224,29 @@ def test_batch_preserves_partial_success(client):
     assert response.success
     assert [order.order_id for order in response.data.orders] == ["201"]
     assert response.data.failed_count == 1
+
+
+def test_local_active_order_count_does_not_block_new_orders(client):
+    client.info.orders = [{"oid": oid} for oid in range(31)]
+
+    single = client.execute_order(
+        {
+            "symbol": "BTC",
+            "side": "Bid",
+            "quantity": "0.001",
+            "price": "32000",
+            "orderType": "Limit",
+        }
+    )
+    batch = client.execute_order_batch(
+        [
+            {"symbol": "BTC", "side": "Bid", "quantity": "0.001", "price": "32000"},
+            {"symbol": "BTC", "side": "Ask", "quantity": "0.001", "price": "34000"},
+        ]
+    )
+
+    assert single.success
+    assert batch.success
 
 
 def test_projected_open_order_exposure_is_bounded(client):

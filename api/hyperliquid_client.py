@@ -58,12 +58,10 @@ class HyperliquidClient(BaseExchangeClient):
         self.timeout = float(self.config.get("timeout", 10.0))
         self.allow_orders = bool(self.config.get("allow_orders", False))
         self.allow_mainnet = bool(self.config.get("allow_mainnet", False))
-        self.max_order_notional = Decimal(str(self.config.get("max_order_notional", "100")))
         # Opening orders use this floor. HyperCore accepts a reduce-only order
         # that closes the remaining position below the floor; the strategy can
         # still use this value to accumulate routine partial-fill dust.
         self.min_order_notional = MIN_ORDER_NOTIONAL
-        self.max_active_orders = int(self.config.get("max_active_orders", 30))
         self.max_position = Decimal(str(self.config.get("max_position", "0")))
 
         if not self.account_address or not self.account_address.startswith("0x"):
@@ -230,13 +228,6 @@ class HyperliquidClient(BaseExchangeClient):
         notional = size * price
         if not reduce_only and notional < MIN_ORDER_NOTIONAL:
             raise ValueError(f"訂單名義價值 {notional} 小於 Hyperliquid 最低要求 $10")
-        if self.max_order_notional > 0 and notional > self.max_order_notional:
-            raise ValueError(
-                f"訂單名義價值 {notional} 超過本地上限 {self.max_order_notional} USDC"
-            )
-        active = self.get_open_orders(symbol)
-        if active.success and len(active.data or []) >= self.max_active_orders:
-            raise ValueError(f"活躍訂單數已達本地上限 {self.max_active_orders}")
 
     def _validate_projected_exposure(self, prepared: List[Tuple[Dict[str, Any], Cloid, Decimal, Decimal]]) -> None:
         """Conservatively include current position and every live opening order."""
@@ -422,13 +413,6 @@ class HyperliquidClient(BaseExchangeClient):
         try:
             self._ensure_can_trade()
             prepared = [self._prepare_order(order) for order in orders_details]
-            current_orders = self.get_open_orders(prepared[0][0]["symbol"])
-            if not current_orders.success:
-                return current_orders
-            if len(current_orders.data or []) + len(prepared) > self.max_active_orders:
-                return ApiResponse.error(
-                    f"批量下單後活躍訂單將超過本地上限 {self.max_active_orders}"
-                )
             self._validate_projected_exposure(prepared)
             if any(item[0]["orderType"] != "Limit" for item in prepared):
                 return super().execute_order_batch(orders_details)  # pragma: no cover

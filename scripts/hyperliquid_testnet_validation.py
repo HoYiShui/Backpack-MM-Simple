@@ -50,8 +50,6 @@ def main() -> int:
         "ws_url": HYPERLIQUID_WS_URL,
         "allow_orders": True,
         "allow_mainnet": False,
-        "max_order_notional": "50",
-        "max_active_orders": 12,
         "max_position": args.max_position,
         "close_on_exit": True,
     }
@@ -142,7 +140,6 @@ def main() -> int:
             "grid_num": args.grid_num,
             "price_range_percent": args.price_range,
             "max_position": args.max_position,
-            "max_order_notional_usdc": 50,
             "close_on_exit": True,
         },
         "checks": {

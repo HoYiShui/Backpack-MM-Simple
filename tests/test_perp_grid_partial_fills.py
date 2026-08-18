@@ -117,6 +117,7 @@ def test_close_partial_fills_keep_remaining_order_until_complete():
 
     strategy._handle_close_order_filled("8", 101.0, "Ask", 0.6)
     assert "8" not in strategy.close_orders
+    assert strategy.grid_completed_count == 1
     assert strategy.grid_level_states[100.0]["locked"] is False
     assert strategy.grid_level_states[100.0]["open_position"] == 0.0
     assert strategy.grid_profit == 1.0
