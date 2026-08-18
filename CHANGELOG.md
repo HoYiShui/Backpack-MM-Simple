@@ -1,4 +1,99 @@
 # Changelog
+## [2.9.0] - 2026-08-17
+
+### 新增
+- **Lighter Robinhood Chain 支援**：新增 `lighter_robinhood` 交易所選項，共用 Lighter REST、簽名與策略邏輯
+- 預設使用 Robinhood Chain REST `https://api.rh.lighter.xyz`、WebSocket `wss://api.rh.lighter.xyz/stream` 與 chain ID `466324`
+- CLI、Web 控制台、WebSocket、永續做市與網格策略均可選擇 Robinhood Chain
+- 新增獨立 `LIGHTER_ROBINHOOD_*` 環境變量，避免與一般 Lighter 主網憑證混用
+- 新增 Robinhood Chain 設定、帳戶索引、REST 與 WebSocket 回歸測試
+
+## [2.8.0] - 2026-02-04
+
+### 新增
+- **StandX 交易所完整支援**：新增 StandX 永續合約交易所整合
+  - 實現 `StandXClient` REST API 客戶端，支援訂單創建、取消、查詢
+  - 實現 `StandXWebSocket` 客戶端，支援公開與私有頻道訂閱
+  - 新增簽名密鑰解碼機制與訂單處理邏輯
+  - 支援倉位與餘額查詢、成交歷史同步
+- **成交資訊處理增強**：新增本地 Maker 訂單檢查機制
+- **WebSocket 頻道訂閱邏輯優化**：Paradex 新增頻道訂閱邏輯
+- CLI 命令行界面新增 StandX 交易所選項
+- Web 界面新增 StandX 交易所選項
+
+### 修復
+- **多交易所 WebSocket 報價獲取問題**：統一報價獲取邏輯至 `BaseWebSocketClient` 基類
+- **Backpack 私有頻道處理**：優化並精簡私有頻道處理邏輯
+
+### 優化
+- **WebSocket 基類重構**：將報價獲取邏輯統一至 `BaseWebSocketClient`，精簡各交易所客戶端冗餘代碼
+- **做市策略重構**：`market_maker.py` 重構以支援 StandX 交易所與多交易所 WebSocket 整合
+- **對沖策略增強**：`maker_taker_hedge.py` 新增本地 Maker 訂單檢查與成交資訊處理
+
+### 變更涉及檔案
+- `api/`: `standx_client.py` (新增), `__init__.py`
+- `ws_client/`: `standx_ws_client.py` (新增), `base_ws_client.py`, `backpack_ws_client.py`, `apex_ws_client.py`, `aster_ws_client.py`, `lighter_ws_client.py`, `paradex_ws_client.py`, `__init__.py`
+- `strategies/`: `market_maker.py`, `maker_taker_hedge.py`, `perp_grid_strategy.py`
+- `cli/commands.py`, `run.py`, `config.py`, `README.md`, `.env.example`
+- `web/`: `server.py`, `static/js/app.js`, `templates/index.html`
+
+## [2.7.0] - 2026-02-02
+
+### 新增
+- **多交易所 WebSocket 客戶端**：新增 Apex、Aster、Lighter、Paradex 四個交易所的 WebSocket 客戶端實現
+  - 所有客戶端繼承自 `BaseWebSocketClient` 抽象基類，提供統一介面
+  - 支援公開頻道訂閱：行情 (Ticker)、訂單簿 (OrderBook)
+  - 支援私有頻道訂閱：訂單更新、成交回報
+- **私有頻道認證機制**：各交易所 WebSocket 客戶端支援 API Key / Secret / Passphrase 認證
+  - Apex: 基於 HMAC 簽名的 login 認證
+  - Aster: WebSocket 私有頻道認證
+  - Lighter: 原生 signer 整合認證
+  - Paradex: EIP-712 簽名認證
+- **標準化數據結構**：統一使用 `WSTickerData`、`WSOrderBookData`、`WSOrderUpdateData`、`WSFillData` 處理不同交易所訊息
+- **連線增強功能**：
+  - 支援 Proxy 代理配置
+  - 可配置的心跳 (Heartbeat) 與 Ping/Pong 機制
+  - 指數退避重連策略 (Exponential Backoff)
+
+### 修復
+- **Lighter 連線異常**：修正 `lighter_client.py` API 連線問題
+- **Paradex 連線異常**：修正 `paradex_client.py` API 連線問題
+- **WebSocket URL 配置**：修正 `config.py` 中的 WS URL 配置
+
+### 優化
+- **做市策略重構**：`market_maker.py` 重構以支援多交易所 WebSocket 整合
+- **模組導出更新**：`ws_client/__init__.py` 新增所有交易所客戶端導出
+
+### 變更涉及檔案
+- `ws_client/`: `apex_ws_client.py`, `aster_ws_client.py`, `lighter_ws_client.py`, `paradex_ws_client.py`, `base_ws_client.py`, `__init__.py`
+- `strategies/`: `market_maker.py`
+- `api/`: `lighter_client.py`, `paradex_client.py`
+- `config.py`, `README.md`
+
+## [2.6.0] - 2026-01-30
+
+### 新增
+- **PARADEX 精度處理優化**：改進浮點數精度計算，確保訂單金額精確性
+
+### 修復
+- **LighterClient 即時行情獲取**：增強即時行情獲取邏輯，優化價格判斷及取消訂單處理
+- **網格點位持倉狀態重置**：支持補單邏輯，解決網格策略補單失敗問題
+- **倉位變化檢測增強**：優化訂單狀態同步邏輯，確保倉位與訂單一致
+- **Aster 網格訂單調整**：移除網格訂單減倉功能，簡化交易邏輯
+- **Lighter 成交問題**：修正 Lighter 交易所成交確認異常
+- **Paradex 成交訂單問題**：修復 Paradex 訂單狀態同步
+- **Aster 網格減倉掛單**：解決減倉掛單邏輯錯誤
+- **倉位處理邏輯增強**：確保正確解析 PositionInfo 並處理不同方向
+
+### 優化
+- **程式碼結構重構**：大規模重構以提升程式碼可讀性與維護性
+- **API 層效能優化**：改進 API 調用效率
+
+### 變更涉及檔案
+- `api/`: `__init__.py`, `apex_client.py`, `base_client.py`, `example_exchange_client.py`, `lighter_client.py`, `paradex_client.py`
+- `strategies/`: `grid_strategy.py`, `maker_taker_hedge.py`, `market_maker.py`, `perp_grid_strategy.py`, `perp_market_maker.py`
+- `cli/commands.py`, `utils/helpers.py`
+
 ## [2.5.0] - 2026-01-21
 
 ### 新增

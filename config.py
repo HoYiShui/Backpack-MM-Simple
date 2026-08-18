@@ -1,6 +1,6 @@
 """
 配置文件 - 全局配置管理中心
-支持多交易所配置（Backpack, Aster, Paradex）
+支持多交易所配置（Backpack, Aster, Paradex, Lighter, Lighter Robinhood, Apex, StandX）
 """
 import os
 from dotenv import load_dotenv
@@ -48,6 +48,7 @@ ASTER_SECRET_KEY = os.getenv('ASTER_SECRET_KEY') or os.getenv('ASTER_SECRET')
 
 # Aster API 端點
 ASTER_BASE_URL = os.getenv('ASTER_BASE_URL', 'https://api.aster.exchange')
+ASTER_WS_URL = os.getenv('ASTER_WS_URL', 'wss://fstream.asterdex.com/ws')
 
 # ==================== Paradex 交易所配置 ====================
 
@@ -57,10 +58,47 @@ PARADEX_PRIVATE_KEY = os.getenv('PARADEX_PRIVATE_KEY')
 
 # Paradex API 端點
 PARADEX_BASE_URL = os.getenv('PARADEX_BASE_URL', 'https://api.prod.paradex.trade/v1')
+PARADEX_WS_URL = os.getenv('PARADEX_WS_URL', 'wss://ws.api.prod.paradex.trade/v1')
 
 # Paradex 簽名設置
 PARADEX_SIGNATURE_TTL_SECONDS = int(os.getenv('PARADEX_SIGNATURE_TTL_SECONDS', '1800'))  # 30分鐘
 PARADEX_JWT_REFRESH_BUFFER = int(os.getenv('PARADEX_JWT_REFRESH_BUFFER', '120'))  # 提前2分鐘刷新
+
+# ==================== Lighter 交易所配置 ====================
+
+LIGHTER_BASE_URL = os.getenv('LIGHTER_BASE_URL', 'https://mainnet.zklighter.elliot.ai')
+LIGHTER_WS_URL = os.getenv('LIGHTER_WS_URL', 'wss://mainnet.zklighter.elliot.ai/stream')
+LIGHTER_CHAIN_ID = int(os.getenv('LIGHTER_CHAIN_ID') or '304')
+
+# ==================== Lighter Robinhood Chain 配置 ====================
+
+LIGHTER_ROBINHOOD_BASE_URL = os.getenv(
+    'LIGHTER_ROBINHOOD_BASE_URL',
+    os.getenv('LIGHTER_RH_BASE_URL', 'https://api.rh.lighter.xyz'),
+)
+LIGHTER_ROBINHOOD_WS_URL = os.getenv(
+    'LIGHTER_ROBINHOOD_WS_URL',
+    os.getenv('LIGHTER_RH_WS_URL', 'wss://api.rh.lighter.xyz/stream'),
+)
+LIGHTER_ROBINHOOD_CHAIN_ID = int(os.getenv(
+    'LIGHTER_ROBINHOOD_CHAIN_ID',
+    os.getenv('LIGHTER_RH_CHAIN_ID', '466324'),
+) or '466324')
+
+# ==================== Apex 交易所配置 ====================
+
+APEX_WS_URL = os.getenv('APEX_WS_URL', 'wss://quote.omni.apex.exchange/realtime_public')
+
+# ==================== StandX 交易所配置 ====================
+
+# StandX API Token (JWT) 與簽名密鑰
+STANDX_API_TOKEN = os.getenv('STANDX_API_TOKEN') or os.getenv('STANDX_JWT')
+# 兼容舊變數 STANDX_SIGNING_KEY
+STANDX_PRIVATE_KEY = os.getenv('STANDX_PRIVATE_KEY') or os.getenv('STANDX_SIGNING_KEY')
+
+# StandX API 端點
+STANDX_BASE_URL = os.getenv('STANDX_BASE_URL', 'https://perps.standx.com')
+STANDX_WS_URL = os.getenv('STANDX_WS_URL', 'wss://perps.standx.com/ws-stream/v1')
 
 # ==================== 向後兼容性（保留舊變數名） ====================
 # 注意：這些變數已被標記為 Deprecated，建議使用上面的 BACKPACK_ 前綴變數

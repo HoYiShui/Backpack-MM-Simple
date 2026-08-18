@@ -12,6 +12,7 @@ from api.aster_client import AsterClient
 from api.paradex_client import ParadexClient
 from api.lighter_client import LighterClient
 from api.apex_client import ApexClient
+from api.standx_client import StandxClient
 from ws_client import BackpackWebSocket
 from strategies.market_maker import MarketMaker
 from strategies.perp_market_maker import PerpetualMarketMaker
@@ -22,6 +23,13 @@ from utils.helpers import calculate_volatility
 from database.db import Database
 from config import API_KEY, SECRET_KEY, ENABLE_DATABASE
 from logger import setup_logger
+from utils.lighter_config import (
+    LIGHTER_ROBINHOOD_EXCHANGE,
+    apply_lighter_defaults,
+    build_lighter_config_from_env,
+    is_lighter_exchange,
+    normalize_lighter_exchange,
+)
 
 logger = setup_logger("cli")
 
@@ -52,37 +60,39 @@ def _resolve_api_credentials(exchange: str, api_key: Optional[str], secret_key: 
             os.getenv("PARADEX_PRIVATE_KEY"),
         ]
         # Paradex 使用 StarkNet 賬户地址和私鑰進行認證
-    elif exchange == "lighter":
-        # Lighter私鑰候選項（支持多個環境變量名）
-        api_candidates = [
-            os.getenv("LIGHTER_PRIVATE_KEY"),
-            os.getenv("LIGHTER_API_KEY"),
-        ]
-        # Account Index候選項
-        account_index_candidates = [
-            os.getenv("LIGHTER_ACCOUNT_INDEX"),
-        ]
-        # 如果沒有account_index，嘗試通過地址自動獲取
-        account_index_value = next((value for value in account_index_candidates if value), None)
-        if not account_index_value:
-            lighter_address = os.getenv("LIGHTER_ADDRESS")
-            if lighter_address:
-                try:
-                    from api.lighter_client import _get_lihgter_account_index
-                    account_index_value = str(_get_lihgter_account_index(lighter_address))
-                    logger.info(f"通過地址 {lighter_address} 自動獲取到 account_index: {account_index_value}")
-                except Exception as e:
-                    logger.warning(f"無法通過地址自動獲取account_index: {e}")
-                    account_index_value = None
-
-        # 將account_index作為secret_candidates返回
-        secret_candidates = [account_index_value] if account_index_value else []
+    elif is_lighter_exchange(exchange):
+        try:
+            lighter_config = build_lighter_config_from_env(
+                exchange,
+                resolve_account_index=True,
+            )
+        except ValueError as exc:
+            logger.warning("無法自動解析 Lighter account_index: %s", exc)
+            lighter_config = build_lighter_config_from_env(
+                exchange,
+                resolve_account_index=False,
+            )
+        return (
+            lighter_config.get("api_private_key"),
+            str(lighter_config["account_index"])
+            if lighter_config.get("account_index") is not None
+            else None,
+        )
     elif exchange == "apex":
         api_candidates = [
             os.getenv("APEX_API_KEY"),
         ]
         secret_candidates = [
             os.getenv("APEX_SECRET_KEY"),
+        ]
+    elif exchange == "standx":
+        api_candidates = [
+            os.getenv("STANDX_API_TOKEN"),
+            os.getenv("STANDX_JWT"),
+        ]
+        secret_candidates = [
+            os.getenv("STANDX_PRIVATE_KEY"),
+            os.getenv("STANDX_SIGNING_KEY"),
         ]
     else:
         api_candidates = [
@@ -103,15 +113,23 @@ def _resolve_api_credentials(exchange: str, api_key: Optional[str], secret_key: 
 def _get_client(api_key=None, secret_key=None, exchange='backpack', exchange_config=None):
     """獲取緩存的客户端實例，避免重複創建"""
     exchange = (exchange or 'backpack').lower()
-    if exchange not in ('backpack', 'aster', 'paradex', 'lighter', 'apex'):
+    lighter_exchange = normalize_lighter_exchange(exchange)
+    if lighter_exchange:
+        exchange = lighter_exchange
+    if exchange not in ('backpack', 'aster', 'paradex', 'lighter', LIGHTER_ROBINHOOD_EXCHANGE, 'apex', 'standx'):
         raise ValueError(f"不支持的交易所: {exchange}")
 
-    config = dict(exchange_config or {})
+    if is_lighter_exchange(exchange):
+        config = build_lighter_config_from_env(exchange, resolve_account_index=False)
+        config.update(exchange_config or {})
+        config = apply_lighter_defaults(exchange, config)
+    else:
+        config = dict(exchange_config or {})
     config_api_key = api_key or config.get('api_key')
     config_secret_key = secret_key or config.get('secret_key') or config.get('private_key')
 
     # Lighter特殊處理：api_key是private_key，secret_key是account_index
-    if exchange == 'lighter':
+    if is_lighter_exchange(exchange):
         if config_api_key:
             config['api_private_key'] = config_api_key
             config.pop('api_key', None)
@@ -121,20 +139,6 @@ def _get_client(api_key=None, secret_key=None, exchange='backpack', exchange_con
             config.pop('private_key', None)
 
         # 確保其他必要的Lighter配置存在
-        if 'base_url' not in config:
-            config['base_url'] = os.getenv('LIGHTER_BASE_URL')
-        if 'api_key_index' not in config:
-            api_key_index = os.getenv('LIGHTER_API_KEY_INDEX')
-            if api_key_index:
-                config['api_key_index'] = api_key_index
-        if 'chain_id' not in config:
-            chain_id = os.getenv('LIGHTER_CHAIN_ID')
-            if chain_id:
-                config['chain_id'] = chain_id
-        if 'verify_ssl' not in config:
-            verify_ssl_env = os.getenv('LIGHTER_VERIFY_SSL')
-            if verify_ssl_env is not None:
-                config['verify_ssl'] = verify_ssl_env.lower() not in ('0', 'false', 'no')
     # Paradex使用private_key
     elif exchange == 'paradex':
         if config_api_key:
@@ -169,7 +173,7 @@ def _get_client(api_key=None, secret_key=None, exchange='backpack', exchange_con
             config.pop('private_key', None)
 
     # 生成緩存鍵
-    if exchange == 'lighter':
+    if is_lighter_exchange(exchange):
         # Lighter使用api_private_key和account_index
         cache_suffix = (
             f"{config.get('api_private_key', '')}_{config.get('account_index', '')}"
@@ -206,8 +210,10 @@ def _get_client(api_key=None, secret_key=None, exchange='backpack', exchange_con
             client_cls = AsterClient
         elif exchange == 'paradex':
             client_cls = ParadexClient
-        elif exchange == 'lighter':
+        elif is_lighter_exchange(exchange):
             client_cls = LighterClient
+        elif exchange == 'standx':
+            client_cls = StandxClient
         else:  # apex
             client_cls = ApexClient
         _client_cache[cache_key] = client_cls(config)
@@ -247,10 +253,28 @@ def get_balance_command(api_key, secret_key):
     if lighter_private and lighter_account_index:
         exchanges_to_check.append(('lighter', lighter_private, lighter_account_index))
 
+    # 檢查 Lighter Robinhood Chain
+    rh_lighter_private, rh_lighter_account_index = _resolve_api_credentials(
+        LIGHTER_ROBINHOOD_EXCHANGE,
+        None,
+        None,
+    )
+    if rh_lighter_private and rh_lighter_account_index:
+        exchanges_to_check.append((
+            LIGHTER_ROBINHOOD_EXCHANGE,
+            rh_lighter_private,
+            rh_lighter_account_index,
+        ))
+
     # 檢查 APEX
     apex_api, apex_secret = _resolve_api_credentials('apex', None, None)
     if apex_api and apex_secret:
         exchanges_to_check.append(('apex', apex_api, apex_secret))
+
+    # 檢查 StandX
+    standx_api, standx_secret = _resolve_api_credentials('standx', None, None)
+    if standx_api and standx_secret:
+        exchanges_to_check.append(('standx', standx_api, standx_secret))
 
     if not exchanges_to_check:
         print("未找到任何已配置的交易所 API 密鑰")
@@ -271,25 +295,27 @@ def get_balance_command(api_key, secret_key):
                 exchange_config['private_key'] = ex_secret_key
                 exchange_config['account_address'] = ex_api_key
                 exchange_config['base_url'] = os.getenv('PARADEX_BASE_URL', 'https://api.prod.paradex.trade/v1')
-            elif exchange == 'lighter':
-                exchange_config = {
+            elif is_lighter_exchange(exchange):
+                exchange_config = build_lighter_config_from_env(
+                    exchange,
+                    resolve_account_index=False,
+                )
+                exchange_config.update({
                     'api_private_key': ex_api_key,
                     'account_index': ex_secret_key,
-                    'api_key_index': os.getenv('LIGHTER_API_KEY_INDEX'),
-                    'base_url': os.getenv('LIGHTER_BASE_URL'),
-                }
-                chain_id = os.getenv('LIGHTER_CHAIN_ID')
-                if chain_id:
-                    exchange_config['chain_id'] = chain_id
-                verify_ssl_env = os.getenv('LIGHTER_VERIFY_SSL')
-                if verify_ssl_env is not None:
-                    exchange_config['verify_ssl'] = verify_ssl_env.lower() not in ('0', 'false', 'no')
+                })
             elif exchange == 'apex':
                 exchange_config = {
                     'api_key': ex_api_key,
                     'secret_key': ex_secret_key,
                     'passphrase': os.getenv('APEX_PASSPHRASE', ''),
                     'base_url': os.getenv('APEX_BASE_URL', 'https://omni.apex.exchange'),
+                }
+            elif exchange == 'standx':
+                exchange_config = {
+                    'api_token': ex_api_key,
+                    'signing_key': ex_secret_key,
+                    'base_url': os.getenv('STANDX_BASE_URL', 'https://perps.standx.com'),
                 }
             else:
                 exchange_config['secret_key'] = ex_secret_key
@@ -298,6 +324,13 @@ def get_balance_command(api_key, secret_key):
             c = _get_client(api_key=ex_api_key, secret_key=secret_for_client, exchange=exchange, exchange_config=exchange_config)
             balances_response = c.get_balance()
             collateral_response = c.get_collateral()
+            collateral_data = collateral_response.data
+            if isinstance(collateral_data, list):
+                collateral_items = collateral_data
+            elif collateral_data:
+                collateral_items = [collateral_data]
+            else:
+                collateral_items = []
             
             if not balances_response.success:
                 print(f"獲取餘額失敗: {balances_response.error_message}")
@@ -359,9 +392,9 @@ def get_balance_command(api_key, secret_key):
                 if not collateral_response.success:
                     print(f"獲取賬户摘要失敗: {collateral_response.error_message}")
                 else:
-                    collateral = collateral_response.data
+                    collateral = collateral_items[0] if collateral_items else None
                     # 支援 CollateralInfo dataclass 或 dict
-                    if hasattr(collateral, 'raw') and collateral.raw:
+                    if collateral and hasattr(collateral, 'raw') and collateral.raw:
                         collateral_dict = collateral.raw
                     elif isinstance(collateral, dict):
                         collateral_dict = collateral
@@ -369,28 +402,66 @@ def get_balance_command(api_key, secret_key):
                         collateral_dict = {}
                     if collateral_dict.get('account'):
                         print("\n賬户摘要:")
+                        account_value = (
+                            collateral.account_value
+                            if hasattr(collateral, 'account_value') and collateral.account_value is not None
+                            else collateral_dict.get('account_value', '0')
+                        )
+                        total_collateral = (
+                            collateral.total_collateral
+                            if hasattr(collateral, 'total_collateral') and collateral.total_collateral is not None
+                            else collateral_dict.get('total_collateral', '0')
+                        )
+                        free_collateral = (
+                            collateral.free_collateral
+                            if hasattr(collateral, 'free_collateral') and collateral.free_collateral is not None
+                            else collateral_dict.get('free_collateral', '0')
+                        )
+                        initial_margin = (
+                            collateral.initial_margin
+                            if hasattr(collateral, 'initial_margin') and collateral.initial_margin is not None
+                            else collateral_dict.get('initial_margin', '0')
+                        )
+                        maintenance_margin = (
+                            collateral.maintenance_margin
+                            if hasattr(collateral, 'maintenance_margin') and collateral.maintenance_margin is not None
+                            else collateral_dict.get('maintenance_margin', '0')
+                        )
+
                         print(f"賬户地址: {collateral_dict.get('account', 'N/A')}")
-                        print(f"賬户價值: {collateral_dict.get('account_value', '0')} USDC")
-                        print(f"總抵押品: {collateral_dict.get('total_collateral', '0')} USDC")
-                        print(f"可用抵押品: {collateral_dict.get('free_collateral', '0')} USDC")
-                        print(f"初始保證金: {collateral_dict.get('initial_margin', '0')} USDC")
-                        print(f"維持保證金: {collateral_dict.get('maintenance_margin', '0')} USDC")
-            elif exchange == 'lighter':
+                        print(f"賬户價值: {account_value} USDC")
+                        print(f"總抵押品: {total_collateral} USDC")
+                        print(f"可用抵押品: {free_collateral} USDC")
+                        print(f"初始保證金: {initial_margin} USDC")
+                        print(f"維持保證金: {maintenance_margin} USDC")
+            elif is_lighter_exchange(exchange):
                 # Lighter 的抵押品信息格式
                 if not collateral_response.success:
                     print(f"獲取抵押品失敗: {collateral_response.error_message}")
                 else:
-                    collateral = collateral_response.data
+                    collateral = collateral_items[0] if collateral_items else None
                     # 支援 CollateralInfo dataclass 或 dict
-                    if hasattr(collateral, 'raw') and collateral.raw:
+                    if collateral and hasattr(collateral, 'raw') and collateral.raw:
                         collateral_dict = collateral.raw
                     elif isinstance(collateral, dict):
                         collateral_dict = collateral
                     else:
                         collateral_dict = {}
-                    total_collateral = collateral_dict.get('totalCollateral', 0)
-                    available_collateral = collateral_dict.get('availableCollateral', 0)
-                    total_asset_value = collateral_dict.get('totalAssetValue', 0)
+                    total_collateral = (
+                        collateral.total_collateral
+                        if hasattr(collateral, 'total_collateral') and collateral.total_collateral is not None
+                        else collateral_dict.get('totalCollateral', 0)
+                    )
+                    available_collateral = (
+                        collateral.free_collateral
+                        if hasattr(collateral, 'free_collateral') and collateral.free_collateral is not None
+                        else collateral_dict.get('availableCollateral', 0)
+                    )
+                    total_asset_value = (
+                        collateral.account_value
+                        if hasattr(collateral, 'account_value') and collateral.account_value is not None
+                        else collateral_dict.get('totalAssetValue', 0)
+                    )
                     cross_asset_value = collateral_dict.get('crossAssetValue', 0)
 
                     print("\n賬户摘要:")
@@ -408,17 +479,29 @@ def get_balance_command(api_key, secret_key):
                 if not collateral_response.success:
                     print(f"獲取抵押品失敗: {collateral_response.error_message}")
                 else:
-                    collateral = collateral_response.data
+                    collateral = collateral_items[0] if collateral_items else None
                     # 支援 CollateralInfo dataclass 或 dict
-                    if hasattr(collateral, 'raw') and collateral.raw:
+                    if collateral and hasattr(collateral, 'raw') and collateral.raw:
                         collateral_dict = collateral.raw
                     elif isinstance(collateral, dict):
                         collateral_dict = collateral
                     else:
                         collateral_dict = {}
-                    total_collateral = collateral_dict.get('totalCollateral', 0)
-                    available_collateral = collateral_dict.get('availableCollateral', 0)
-                    token = collateral_dict.get('token', 'USDC')
+                    total_collateral = (
+                        collateral.total_collateral
+                        if hasattr(collateral, 'total_collateral') and collateral.total_collateral is not None
+                        else collateral_dict.get('totalCollateral', 0)
+                    )
+                    available_collateral = (
+                        collateral.free_collateral
+                        if hasattr(collateral, 'free_collateral') and collateral.free_collateral is not None
+                        else collateral_dict.get('availableCollateral', 0)
+                    )
+                    token = (
+                        collateral.asset
+                        if hasattr(collateral, 'asset') and collateral.asset
+                        else collateral_dict.get('token', 'USDC')
+                    )
                     maker_fee = collateral_dict.get('makerFeeRate', '0')
                     taker_fee = collateral_dict.get('takerFeeRate', '0')
 
@@ -432,23 +515,27 @@ def get_balance_command(api_key, secret_key):
                 if not collateral_response.success:
                     print(f"獲取抵押品失敗: {collateral_response.error_message}")
                 else:
-                    collateral = collateral_response.data
-                    # 支援 CollateralInfo dataclass 或 dict
-                    if hasattr(collateral, 'raw') and collateral.raw:
-                        collateral_dict = collateral.raw
-                    elif isinstance(collateral, dict):
-                        collateral_dict = collateral
-                    else:
-                        collateral_dict = {}
-                    assets = collateral_dict.get('assets') or collateral_dict.get('collateral', [])
+                    assets = collateral_items
+                    if not assets and isinstance(collateral_response.raw, dict):
+                        assets = collateral_response.raw.get('assets') or collateral_response.raw.get('collateral', [])
+
                     if assets:
                         print("\n抵押品資產:")
                         for item in assets:
-                            symbol = item.get('symbol', '')
-                            total = item.get('totalQuantity', '')
-                            available = item.get('availableQuantity', '')
-                            lend = item.get('lendQuantity', '')
-                            collateral_value = item.get('collateralValue', '')
+                            raw = item.raw if hasattr(item, 'raw') else item if isinstance(item, dict) else {}
+                            if hasattr(item, 'asset'):
+                                symbol = item.asset
+                                total = item.total_collateral
+                                available = item.free_collateral
+                            elif isinstance(item, dict):
+                                symbol = item.get('symbol', '') or item.get('asset', '')
+                                total = item.get('totalQuantity', item.get('total_collateral', ''))
+                                available = item.get('availableQuantity', item.get('free_collateral', ''))
+                            else:
+                                continue
+
+                            lend = raw.get('lendQuantity', '') if isinstance(raw, dict) else ''
+                            collateral_value = raw.get('collateralValue', '') if isinstance(raw, dict) else ''
                             print(f"{symbol}: 總量 {total}, 可用 {available}, 出借中 {lend}, 抵押價值 {collateral_value}")
         
         except Exception as e:
@@ -653,10 +740,13 @@ def configure_rebalance_settings():
 def run_market_maker_command(api_key, secret_key):
     """執行做市策略命令"""
     # [整合功能] 1. 增加交易所選擇
-    exchange_input = input("請選擇交易所 (backpack/aster/paradex/lighter/apex，默認 backpack): ").strip().lower()
+    exchange_input = input("請選擇交易所 (backpack/aster/paradex/lighter/lighter_robinhood/apex/standx，默認 backpack): ").strip().lower()
+    normalized_lighter = normalize_lighter_exchange(exchange_input)
+    if normalized_lighter:
+        exchange_input = normalized_lighter
 
     # 處理交易所選擇
-    if exchange_input in ('backpack', 'aster', 'paradex', 'lighter', 'apex', ''):
+    if exchange_input in ('backpack', 'aster', 'paradex', 'lighter', LIGHTER_ROBINHOOD_EXCHANGE, 'apex', 'standx', ''):
         exchange = exchange_input if exchange_input else 'backpack'
     else:
         print(f"警告: 不識別的交易所 '{exchange_input}'，使用默認 'backpack'")
@@ -693,27 +783,27 @@ def run_market_maker_command(api_key, secret_key):
             'account_address': api_key or os.getenv('PARADEX_ACCOUNT_ADDRESS'),  # StarkNet 賬户地址
             'base_url': os.getenv('PARADEX_BASE_URL', 'https://api.prod.paradex.trade/v1'),
         }
-    elif exchange == 'lighter':
-        exchange_config = {
+    elif is_lighter_exchange(exchange):
+        exchange_config = build_lighter_config_from_env(
+            exchange,
+            resolve_account_index=False,
+        )
+        exchange_config.update({
             'api_private_key': api_key,
             'account_index': secret_key,
-            'base_url': os.getenv('LIGHTER_BASE_URL'),
-        }
-        api_key_index = os.getenv('LIGHTER_API_KEY_INDEX')
-        if api_key_index:
-            exchange_config['api_key_index'] = api_key_index
-        chain_id = os.getenv('LIGHTER_CHAIN_ID')
-        if chain_id:
-            exchange_config['chain_id'] = chain_id
-        verify_ssl_env = os.getenv('LIGHTER_VERIFY_SSL')
-        if verify_ssl_env is not None:
-            exchange_config['verify_ssl'] = verify_ssl_env.lower() not in ('0', 'false', 'no')
+        })
     elif exchange == 'apex':
         exchange_config = {
             'api_key': api_key,
             'secret_key': secret_key,
             'passphrase': os.getenv('APEX_PASSPHRASE', ''),
             'base_url': os.getenv('APEX_BASE_URL', 'https://omni.apex.exchange'),
+        }
+    elif exchange == 'standx':
+        exchange_config = {
+            'api_token': api_key,
+            'signing_key': secret_key,
+            'base_url': os.getenv('STANDX_BASE_URL', 'https://perps.standx.com'),
         }
     else:
         print("錯誤：不支持的交易所。")
@@ -1458,7 +1548,9 @@ def main_cli(api_key=API_KEY, secret_key=SECRET_KEY, enable_database=ENABLE_DATA
         'aster': 'Aster',
         'paradex': 'Paradex',
         'lighter': 'Lighter',
+        LIGHTER_ROBINHOOD_EXCHANGE: 'Lighter Robinhood Chain',
         'apex': 'APEX',
+        'standx': 'StandX',
     }.get(exchange.lower(), 'Backpack')
 
     while True:

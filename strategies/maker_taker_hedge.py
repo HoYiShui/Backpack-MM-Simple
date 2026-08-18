@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from api import PositionInfo
 from logger import setup_logger
 from strategies.market_maker import MarketMaker, format_balance
 from strategies.perp_market_maker import PerpetualMarketMaker
@@ -100,7 +101,8 @@ class _MakerTakerHedgeMixin:
                     format_balance(buy_price),
                     format_balance(buy_qty),
                 )
-                self.active_buy_orders.append(result.raw)
+                if result.data:
+                    self.active_buy_orders.append(result.data)
                 self.orders_placed += 1
 
         if sell_qty >= self.min_order_size:
@@ -118,7 +120,8 @@ class _MakerTakerHedgeMixin:
                     format_balance(sell_price),
                     format_balance(sell_qty),
                 )
-                self.active_sell_orders.append(result.raw)
+                if result.data:
+                    self.active_sell_orders.append(result.data)
                 self.orders_placed += 1
 
     def _determine_order_sizes(self, buy_price: float, ask_price: float) -> Tuple[Optional[float], Optional[float]]:
@@ -187,15 +190,26 @@ class _MakerTakerHedgeMixin:
         side = fill_info.get("side")
         quantity = float(fill_info.get("quantity", 0) or 0)
         price = float(fill_info.get("price", 0) or 0)
+        order_id = fill_info.get("order_id")
+        client_id = fill_info.get("client_id")
         maker_flag = None
         for key in ("is_maker", "maker", "isMaker", "m"):
             if key in fill_info:
                 maker_flag = fill_info.get(key)
                 break
         is_maker = _to_bool(maker_flag)
-        if is_maker is False:
+
+        own_maker_order = self._is_own_maker_order(order_id, client_id)
+        if is_maker is False and not own_maker_order:
             logger.debug("忽略 Taker 成交事件，無需對沖")
             return
+
+        if is_maker is None and not own_maker_order:
+            logger.debug("成交未標記 Maker/Taker，且非本地掛單，跳過對沖")
+            return
+
+        if own_maker_order and is_maker is False:
+            logger.info("成交標記為 Taker，但屬於本地 Maker 掛單，仍執行對沖")
         
         if not side or quantity <= 0:
             logger.warning("成交資訊不完整，跳過對沖")
@@ -268,6 +282,25 @@ class _MakerTakerHedgeMixin:
             residual_amount,
             residual_side,
         )
+
+    def _is_own_maker_order(self, order_id: Optional[str], client_id: Optional[str]) -> bool:
+        """檢查成交是否來自本地掛出的 Maker 訂單。"""
+        if not order_id and not client_id:
+            return False
+
+        def _match(candidate: Optional[str], target: Optional[str]) -> bool:
+            if not candidate or not target:
+                return False
+            return str(candidate) == str(target)
+
+        for order in self.active_buy_orders + self.active_sell_orders:
+            if _match(getattr(order, "order_id", None), order_id) or _match(getattr(order, "order_id", None), client_id):
+                return True
+            if _match(getattr(order, "client_order_id", None), order_id) or _match(getattr(order, "client_order_id", None), client_id):
+                return True
+            if _match(getattr(order, "client_id", None), order_id) or _match(getattr(order, "client_id", None), client_id):
+                return True
+        return False
 
     def _execute_taker_hedge(
         self,
@@ -489,24 +522,25 @@ class _MakerTakerHedgeMixin:
                     if not positions:
                         logger.debug("無倉位記錄，當前倉位為0")
                         return 0.0
-                        
+
                     position = positions[0]
-                    # 支援 PositionInfo dataclass
-                    if hasattr(position, 'size'):
-                        size_value = float(position.size or 0)
-                        # 根據 side 決定正負號：LONG=正, SHORT=負
-                        if hasattr(position, 'side'):
-                            if position.side == "SHORT":
-                                size_value = -size_value
-                            # LONG 或 FLAT 保持原值
-                        return size_value
-                    # 後備：字典格式
-                    for field in ["netQuantity", "size", "position_size", "amount"]:
-                        if field in position:
-                            return float(position[field] or 0)
-                            
-                    logger.warning(f"倉位信息中找不到數量字段: {position}")
-                    return 0.0
+                    if not isinstance(position, PositionInfo):
+                        logger.warning("倉位資料不是標準 PositionInfo: %s", type(position))
+                        return None
+
+                    size_value = float(position.size or 0)
+                    side = str(position.side or "").upper()
+                    if side == "SHORT":
+                        size_value = -abs(size_value)
+                    elif side == "LONG":
+                        size_value = abs(size_value)
+                    elif side == "FLAT":
+                        size_value = 0.0
+                    else:
+                        logger.warning("倉位方向非標準: %s", position.side)
+                        return None
+
+                    return size_value
                 
                 logger.error(f"意外的API響應格式: {positions}")
                 return None
@@ -616,8 +650,10 @@ class _MakerTakerHedgeMixin:
             "timeInForce": "GTC",
         }
 
+        # Maker-Taker 策略需要確保掛單為 Maker
+        order["postOnly"] = True
+
         if getattr(self, "exchange", "backpack") == "backpack":
-            order["postOnly"] = True
             order["autoLendRedeem"] = True
             order["autoLend"] = True
 

@@ -9,12 +9,18 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union, Any, Set, Deque
 from concurrent.futures import ThreadPoolExecutor
 
-from api.bp_client import BPClient
-from api.aster_client import AsterClient
-from api.lighter_client import LighterClient
-from ws_client import BackpackWebSocket
+from api import get_client
+from ws_client import (
+    BackpackWebSocket,
+    AsterWebSocket,
+    ParadexWebSocket,
+    LighterWebSocket,
+    ApexWebSocket,
+    StandxWebSocket,
+)
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility, format_quantity
+from utils.lighter_config import is_lighter_exchange
 from logger import setup_logger
 import traceback
 
@@ -55,24 +61,15 @@ class MarketMaker:
         self.symbol = symbol
         self.base_spread_percentage = base_spread_percentage
         self.order_quantity = order_quantity
+        exchange = (exchange or "backpack").lower()
         self.exchange = exchange
         self.exchange_config = exchange_config or {}
+
+        self.ws_data_stale_seconds = float(self.exchange_config.get("ws_data_stale_seconds", 5.0))
+        self._last_ws_stale_log_ts = 0.0
         
         # 初始化交易所客户端
-        if exchange == 'backpack':
-            self.client = BPClient(self.exchange_config)
-        elif exchange == 'aster':
-            self.client = AsterClient(self.exchange_config)
-        elif exchange == 'paradex':
-            from api.paradex_client import ParadexClient
-            self.client = ParadexClient(self.exchange_config)
-        elif exchange == 'lighter':
-            self.client = LighterClient(self.exchange_config)
-        elif exchange == 'apex':
-            from api.apex_client import ApexClient
-            self.client = ApexClient(self.exchange_config)
-        else:
-            raise ValueError(f"不支持的交易所: {exchange}")
+        self.client = get_client(exchange, self.exchange_config)
             
         self.max_orders = max_orders
         self.rebalance_threshold = rebalance_threshold
@@ -122,37 +119,26 @@ class MarketMaker:
         if not market_info:
             raise ValueError(f"無法獲取 {symbol} 的市場限制")
         
-        # 保存原始數據供後續使用（支援 MarketInfo dataclass 或 dict）
-        if hasattr(market_info, 'raw') and market_info.raw:
-            self.market_limits = market_info.raw
-        elif isinstance(market_info, dict):
-            self.market_limits = market_info
-        else:
-            # MarketInfo dataclass，轉換為 dict 方便存取
-            self.market_limits = {
-                'base_asset': getattr(market_info, 'base_asset', symbol),
-                'quote_asset': getattr(market_info, 'quote_asset', ''),
-                'base_precision': getattr(market_info, 'base_precision', 8),
-                'quote_precision': getattr(market_info, 'quote_precision', 8),
-                'min_order_size': getattr(market_info, 'min_order_size', 0),
-                'tick_size': getattr(market_info, 'tick_size', 0.00000001),
-            }
-        
-        # 從 MarketInfo dataclass 或 dict 取值
-        if hasattr(market_info, 'base_asset'):
-            self.base_asset = market_info.base_asset
-            self.quote_asset = market_info.quote_asset
-            self.base_precision = market_info.base_precision
-            self.quote_precision = market_info.quote_precision
-            self.min_order_size = float(market_info.min_order_size)
-            self.tick_size = float(market_info.tick_size)
-        else:
-            self.base_asset = market_info.get('base_asset', symbol)
-            self.quote_asset = market_info.get('quote_asset', '')
-            self.base_precision = market_info.get('base_precision', 8)
-            self.quote_precision = market_info.get('quote_precision', 8)
-            self.min_order_size = float(market_info.get('min_order_size', 0))
-            self.tick_size = float(market_info.get('tick_size', 0.00000001))
+        if not hasattr(market_info, 'base_asset'):
+            raise ValueError(f"市場限制返回非標準 MarketInfo: {type(market_info)}")
+
+        # 保存原始數據供後續使用（MarketInfo.raw 或基於 dataclass 的字典）
+        self.market_limits = market_info.raw or {
+            'base_asset': market_info.base_asset,
+            'quote_asset': market_info.quote_asset,
+            'base_precision': market_info.base_precision,
+            'quote_precision': market_info.quote_precision,
+            'min_order_size': market_info.min_order_size,
+            'tick_size': market_info.tick_size,
+        }
+
+        # 從 MarketInfo dataclass 取值
+        self.base_asset = market_info.base_asset
+        self.quote_asset = market_info.quote_asset
+        self.base_precision = market_info.base_precision
+        self.quote_precision = market_info.quote_precision
+        self.min_order_size = float(market_info.min_order_size or 0)
+        self.tick_size = float(market_info.tick_size or 0.00000001)
         
         # 交易量統計
         self.maker_buy_volume = 0
@@ -189,15 +175,83 @@ class MarketMaker:
         self._last_reconnect_attempt = 0
 
         # 添加代理參數
-        # 建立WebSocket連接（僅對Backpack）
+        # 建立 WebSocket 連接
+        self.ws = None
+        self.private_ws = None
         if exchange == 'backpack':
             self.ws = BackpackWebSocket(api_key, secret_key, symbol, self.on_ws_message, auto_reconnect=True)
+        elif exchange == 'aster':
+            # 公共行情使用 public WS，私有成交使用 listenKey WS
+            self.ws = AsterWebSocket(
+                api_key=api_key,
+                secret_key=secret_key,
+                symbol=symbol,
+                enable_private=False,
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+            )
+            self.private_ws = AsterWebSocket(
+                api_key=api_key,
+                secret_key=secret_key,
+                symbol=symbol,
+                enable_private=True,
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+            )
+        elif exchange == 'paradex':
+            account_address = self.exchange_config.get('account_address') or api_key
+            private_key = self.exchange_config.get('private_key') or secret_key
+            self.ws = ParadexWebSocket(
+                account_address=account_address,
+                private_key=private_key,
+                symbol=symbol,
+                enable_private=True,
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+            )
+        elif is_lighter_exchange(exchange):
+            self.ws = LighterWebSocket(
+                symbol=symbol,
+                enable_private=True,
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+                exchange=exchange,
+                rest_config=self.exchange_config,
+            )
+        elif exchange == 'apex':
+            passphrase = self.exchange_config.get('passphrase')
+            # 公共行情使用 public WS，私有成交使用 private WS
+            self.ws = ApexWebSocket(
+                api_key=api_key,
+                secret_key=secret_key,
+                passphrase=passphrase,
+                symbol=symbol,
+                enable_private=False,
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+            )
+            self.private_ws = ApexWebSocket(
+                api_key=api_key,
+                secret_key=secret_key,
+                passphrase=passphrase,
+                symbol=symbol,
+                enable_private=True,
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+            )
+        elif exchange == 'standx':
+            self.ws = StandxWebSocket(
+                api_token=api_key,
+                symbol=symbol,
+                enable_private=True,
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+            )
+
+        if self.ws:
             self.ws.connect()
-        elif exchange == 'xx':
-            ...
-            self.ws = None
-        else:
-            self.ws = None  # 不使用WebSocket
+        if self.private_ws:
+            self.private_ws.connect()
         # 執行緒池用於後台任務
         self.executor = ThreadPoolExecutor(max_workers=3)
 
@@ -206,6 +260,7 @@ class MarketMaker:
         self._processed_fill_ids: Set[str] = set()
         self._recent_fill_ids: Deque[str] = deque(maxlen=500)
         self._last_fill_timestamp: int = 0
+        self._processed_ws_order_ids: Set[str] = set()
 
         # 等待WebSocket連接建立並進行初始化訂閲
         self._initialize_websocket()
@@ -214,8 +269,8 @@ class MarketMaker:
         self._load_trading_stats()
         self._load_recent_trades()
 
-        # 針對無 WebSocket 的交易所使用 REST 成交同步
-        if self.exchange in ('aster', 'lighter', 'apex'):
+        # 僅在沒有 WebSocket 時使用 REST 成交同步
+        if (self.exchange in ('aster', 'apex', 'standx') or is_lighter_exchange(self.exchange)) and self.ws is None:
             self._bootstrap_fill_history()
         
         logger.info(f"初始化做市商: {symbol}")
@@ -360,13 +415,17 @@ class MarketMaker:
             logger.debug(f"抵押品原始數據: {collateral_response.raw}")
             if not collateral_response.success:
                 logger.warning(f"獲取抵押品餘額失敗: {collateral_response.error_message}")
-                collateral_assets = []
+                collateral_items = []
             else:
-                # 從 raw 數據中提取抵押品資產
-                raw_data = collateral_response.raw or {}
-                collateral_assets = raw_data.get('assets') or raw_data.get('collateral', [])
+                collateral_data = collateral_response.data
+                if isinstance(collateral_data, list):
+                    collateral_items = collateral_data
+                elif collateral_data:
+                    collateral_items = [collateral_data]
+                else:
+                    collateral_items = []
 
-            logger.debug(f"抵押品資產列表: {collateral_assets}")
+            logger.debug(f"抵押品資產筆數: {len(collateral_items)}")
 
             # 初始化總餘額字典
             total_balances = {}
@@ -387,40 +446,53 @@ class MarketMaker:
             logger.debug(f"處理普通餘額後的 total_balances: {total_balances}")
 
             # 添加抵押品餘額
-            for item in collateral_assets:
-                symbol = item.get('symbol', '')
-                if symbol:
-                    total_quantity = float(item.get('totalQuantity', 0))
-                    available_quantity = float(item.get('availableQuantity', 0))
-                    lend_quantity = float(item.get('lendQuantity', 0))
+            for item in collateral_items:
+                if not hasattr(item, 'asset'):
+                    logger.warning("抵押品資料不是標準 CollateralInfo: %s", type(item))
+                    continue
 
-                    logger.debug(f"處理抵押品: {symbol}, 總量={total_quantity}, 可用={available_quantity}, 借出={lend_quantity}")
+                symbol = item.asset
+                total_quantity = float(item.total_collateral or 0)
+                available_quantity = float(item.free_collateral or 0)
+                raw = item.raw if getattr(item, 'raw', None) else {}
 
-                    # 對於 Backpack 抵押品，使用 totalQuantity 作為可用餘額
-                    # 因為借貸中的資產（lendQuantity）也可以用於交易
-                    effective_available = total_quantity
+                if not symbol:
+                    continue
 
-                    if symbol not in total_balances:
-                        total_balances[symbol] = {
-                            'available': 0,
-                            'locked': 0,
-                            'total': 0,
-                            'collateral_available': effective_available,
-                            'collateral_total': total_quantity
-                        }
-                    else:
-                        total_balances[symbol]['collateral_available'] = effective_available
-                        total_balances[symbol]['collateral_total'] = total_quantity
+                lend_quantity = 0.0
+                if isinstance(raw, dict):
+                    lend_quantity = float(raw.get('lendQuantity') or raw.get('lend_quantity') or 0)
+                    if raw.get('totalQuantity') is not None:
+                        total_quantity = float(raw.get('totalQuantity') or total_quantity)
+                    if raw.get('availableQuantity') is not None:
+                        available_quantity = float(raw.get('availableQuantity') or available_quantity)
 
-                    # 更新總可用量和總量
-                    total_balances[symbol]['total_available'] = (
-                        total_balances[symbol]['available'] +
-                        total_balances[symbol]['collateral_available']
-                    )
-                    total_balances[symbol]['total_all'] = (
-                        total_balances[symbol]['total'] +
-                        total_balances[symbol]['collateral_total']
-                    )
+                logger.debug(f"處理抵押品: {symbol}, 總量={total_quantity}, 可用={available_quantity}, 借出={lend_quantity}")
+
+                # 對於 Backpack 抵押品，total_quantity 視為可用餘額
+                effective_available = total_quantity if self.exchange == "backpack" else available_quantity
+
+                if symbol not in total_balances:
+                    total_balances[symbol] = {
+                        'available': 0,
+                        'locked': 0,
+                        'total': 0,
+                        'collateral_available': effective_available,
+                        'collateral_total': total_quantity
+                    }
+                else:
+                    total_balances[symbol]['collateral_available'] = effective_available
+                    total_balances[symbol]['collateral_total'] = total_quantity
+
+                # 更新總可用量和總量
+                total_balances[symbol]['total_available'] = (
+                    total_balances[symbol]['available'] +
+                    total_balances[symbol]['collateral_available']
+                )
+                total_balances[symbol]['total_all'] = (
+                    total_balances[symbol]['total'] +
+                    total_balances[symbol]['collateral_total']
+                )
 
             # 確保所有資產都有total_available和total_all字段
             for asset in total_balances:
@@ -479,10 +551,17 @@ class MarketMaker:
             # 初始化訂單簿
             orderbook_initialized = self.ws.initialize_orderbook()
 
+            ticker_channel, depth_channel, _order_update_channel = self._get_ws_channel_names()
+
             # 訂閲深度流和行情數據
             if orderbook_initialized:
-                depth_subscribed = self.ws.subscribe_depth()
-                ticker_subscribed = self.ws.subscribe_bookTicker()
+                depth_subscribed = True
+                ticker_subscribed = True
+
+                if depth_channel:
+                    depth_subscribed = self.ws.subscribe_depth()
+                if ticker_channel:
+                    ticker_subscribed = self.ws.subscribe_ticker()
 
                 if depth_subscribed and ticker_subscribed:
                     logger.info("數據流訂閲成功!")
@@ -491,6 +570,62 @@ class MarketMaker:
             self.subscribe_order_updates()
         else:
             logger.info("WebSocket 初始連接未建立，使用 REST API 模式（WebSocket 將在後台自動重連）")
+
+    def _get_ws_channel_names(self) -> Tuple[str, str, str]:
+        """取得當前 WS 的行情/深度/私有頻道名稱。"""
+        if not self.ws and not self.private_ws:
+            return "", "", ""
+        ticker_channel = ""
+        depth_channel = ""
+        order_update_channel = ""
+        try:
+            if self.ws:
+                ticker_channel = self.ws.get_ticker_channel() or ""
+        except Exception:
+            ticker_channel = ""
+        try:
+            if self.ws:
+                depth_channel = self.ws.get_depth_channel() or ""
+        except Exception:
+            depth_channel = ""
+        try:
+            ws_for_private = self.private_ws or self.ws
+            if ws_for_private:
+                order_update_channel = ws_for_private.get_order_update_channel() or ""
+        except Exception:
+            order_update_channel = ""
+        return ticker_channel, depth_channel, order_update_channel
+
+    def _is_ws_channel_subscribed(self, channel: str) -> bool:
+        if not channel:
+            return True
+        if not self.ws:
+            return False
+        return channel in self.ws.subscriptions
+
+    def _has_private_subscription(self, channel: str) -> bool:
+        if not channel:
+            return True
+        ws = self.private_ws or self.ws
+        if not ws:
+            return False
+        if channel == "private":
+            # Paradex/Lighter/Aster 等私有流不一定在 subscriptions 列表中
+            for sub in ws.subscriptions:
+                if sub.startswith(("orders.", "fills.", "account.", "order", "trade", "user")):
+                    return True
+            private_channels = getattr(ws, "_private_channels", None) or []
+            for sub in private_channels:
+                if sub in ws.subscriptions:
+                    return True
+            if getattr(ws, "_auth_completed", False) or getattr(ws, "_auth_sent", False):
+                return True
+            if getattr(ws, "enable_private", False) and (
+                self.exchange == "aster" or is_lighter_exchange(self.exchange)
+            ):
+                return True
+            return False
+        return channel in ws.subscriptions
     
     def _load_trading_stats(self):
         """從數據庫加載交易統計數據"""
@@ -588,7 +723,7 @@ class MarketMaker:
 
     def _sync_fill_history(self, bootstrap: bool = False) -> None:
         """透過 REST API 同步最新成交"""
-        if self.exchange not in ('aster', 'lighter', 'apex'):
+        if self.exchange not in ('aster', 'apex', 'standx') and not is_lighter_exchange(self.exchange):
             return
 
         exchange_label = self.exchange.capitalize()
@@ -663,177 +798,47 @@ class MarketMaker:
 
     def _normalize_fill_history_response(self, response) -> List[Dict[str, Any]]:
         """將 REST API 回傳的成交資料轉換為統一格式"""
-        # 支援新的 ApiResponse 格式
+        if response is None:
+            return []
+
         if hasattr(response, 'success'):
             if not response.success:
                 logger.error(f"獲取成交歷史失敗: {response.error_message}")
                 return []
-            # 如果 data 是空列表，直接返回
-            if response.data is not None and isinstance(response.data, list):
-                if len(response.data) == 0:
-                    return []
-                # 如果是 List[TradeInfo]，直接轉換
-                if hasattr(response.data[0], 'trade_id'):
-                    result = []
-                    for t in response.data:
-                        # 從 raw 中提取 clientId（APEX 用 clientId 追蹤訂單）
-                        raw = t.raw if hasattr(t, 'raw') and t.raw else {}
-                        client_id = raw.get('clientId') or raw.get('client_id') or raw.get('clientOrderId')
-                        result.append({
-                            'fill_id': t.trade_id,
-                            'order_id': t.order_id,
-                            'client_id': str(client_id) if client_id else None,  # 從 raw 提取 clientId
-                            'symbol': t.symbol,
-                            'side': t.side,
-                            'price': float(t.price) if t.price is not None else None,
-                            'quantity': float(t.size) if t.size is not None else None,  # TradeInfo 使用 size
-                            'fee': float(t.fee) if t.fee is not None else 0.0,  # fee 可以是 0，不能用 if t.fee 判斷
-                            'fee_asset': t.fee_asset,
-                            'is_maker': t.is_maker,
-                            'timestamp': t.timestamp,
-                        })
-                    return result
-            data = response.raw
+            data = response.data or []
         else:
             data = response
 
-        if isinstance(data, dict):
-            # APEX 格式: {"data": {"orders": [...]}}
-            inner_data = data.get('data', data)
-            if isinstance(inner_data, dict):
-                # APEX 成交在 orders 字段中
-                data = inner_data.get('orders', inner_data.get('fills', inner_data))
-            else:
-                data = inner_data
-
         if not isinstance(data, list):
-            # 只在非空 dict（不是純狀態響應）時顯示警告
-            if isinstance(data, dict) and data.get('orders') is None and data.get('fills') is None:
-                # APEX 返回 {"code": 0, "msg": "", ...} 表示沒有成交，這是正常的
-                return []
             logger.warning(f"成交歷史返回格式異常: {type(data)}")
             return []
 
-        fills: List[Dict[str, Any]] = []
+        if data and not hasattr(data[0], 'trade_id'):
+            logger.warning("成交歷史未返回標準 TradeInfo 列表，忽略處理")
+            return []
 
-        def _extract(entry: Dict[str, Any], *keys: str) -> Any:
-            for key in keys:
-                if key in entry and entry[key] not in (None, ""):
-                    return entry[key]
-            return None
+        result: List[Dict[str, Any]] = []
+        for t in data:
+            raw = t.raw if hasattr(t, 'raw') and t.raw else {}
+            client_id = None
+            if isinstance(raw, dict):
+                client_id = raw.get('clientId') or raw.get('client_id') or raw.get('clientOrderId')
 
-        def _to_float(value: Any) -> Optional[float]:
-            if value in (None, "", "NaN"):
-                return None
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-
-        for entry in data:
-            if not isinstance(entry, dict):
-                continue
-
-            fill_id = _extract(
-                entry,
-                "id",
-                "fillId",
-                "fill_id",
-                "tradeId",
-                "trade_id",
-                "executionId",
-                "execution_id",
-                "matchFillId",  # APEX
-                "t",
-            )
-            order_id = _extract(
-                entry,
-                "orderId",
-                "order_id",
-                "orderIndex",
-                "order_index",
-                "ask_id",
-                "bid_id",
-                "i",
-            )
-            side = _extract(entry, "side", "S")
-            price = _to_float(_extract(entry, "price", "p", "L"))
-            quantity = _to_float(_extract(entry, "quantity", "qty", "q", "l", "size"))
-            fee_asset = _extract(
-                entry,
-                "fee_asset",
-                "feeAsset",
-                "commissionAsset",
-                "N",
-                "fee_currency",
-                "feeCurrency",
-            )
-            # APEX 使用 direction: MAKER/TAKER
-            maker_flag = _extract(entry, "maker", "isMaker", "m", "is_maker", "direction")
-            timestamp_raw = _extract(entry, "time", "timestamp", "T", "ts", "createdAt", "updatedTime")
-
-            maker_fee = _to_float(_extract(entry, "maker_fee", "makerFee"))
-            taker_fee = _to_float(_extract(entry, "taker_fee", "takerFee"))
-            fee_primary = _extract(entry, "fee", "commission", "n", "fee_value")
-            fee_value = _to_float(fee_primary)
-
-            derived_maker_flag: Optional[bool] = None
-            if maker_fee is not None and abs(maker_fee) > 0:
-                derived_maker_flag = True
-            elif taker_fee is not None and abs(taker_fee) > 0:
-                derived_maker_flag = False
-
-            is_maker = True
-            if isinstance(maker_flag, bool):
-                is_maker = maker_flag
-            elif maker_flag is not None:
-                maker_str = str(maker_flag).lower()
-                # APEX uses direction: MAKER/TAKER
-                is_maker = maker_str in ("true", "1", "yes", "maker")
-            elif derived_maker_flag is not None:
-                is_maker = derived_maker_flag
-
-            if fee_value is None:
-                if is_maker and maker_fee is not None:
-                    fee_value = maker_fee
-                elif not is_maker and taker_fee is not None:
-                    fee_value = taker_fee
-                elif maker_fee is not None:
-                    fee_value = maker_fee
-                elif taker_fee is not None:
-                    fee_value = taker_fee
-
-            if fee_value is None:
-                fee_value = 0.0
-
-            try:
-                timestamp_value = int(float(timestamp_raw)) if timestamp_raw is not None else 0
-            except (TypeError, ValueError):
-                timestamp_value = 0
-
-            # APEX: 提取 clientId/clientOrderId 作為備用 ID（下單時使用的是 clientId）
-            client_id = _extract(
-                entry,
-                "clientId",
-                "client_id",
-                "clientOrderId",
-                "client_order_id",
-            )
-
-            fills.append({
-                'fill_id': str(fill_id) if fill_id is not None else None,
-                'order_id': str(order_id) if order_id is not None else None,
-                'client_id': str(client_id) if client_id is not None else None,  # APEX 用 clientId 追蹤訂單
-                'side': side,
-                'price': price,
-                'quantity': quantity,
-                'fee': fee_value,
-                'fee_asset': fee_asset,
-                'is_maker': is_maker,
-                'timestamp': timestamp_value,
+            result.append({
+                'fill_id': t.trade_id,
+                'order_id': t.order_id,
+                'client_id': str(client_id) if client_id else None,
+                'symbol': t.symbol,
+                'side': t.side,
+                'price': float(t.price) if t.price is not None else None,
+                'quantity': float(t.size) if t.size is not None else None,
+                'fee': float(t.fee) if t.fee is not None else 0.0,
+                'fee_asset': t.fee_asset,
+                'is_maker': t.is_maker,
+                'timestamp': t.timestamp,
             })
 
-        return fills
+        return result
 
     def _has_seen_fill(self, fill_id: Optional[str], timestamp: int) -> bool:
         """判斷成交是否已處理"""
@@ -1018,16 +1023,13 @@ class MarketMaker:
 
     def check_ws_connection(self):
         """檢查並恢復WebSocket連接"""
-        if not self.ws:
-            # aster, paradex, lighter, apex 沒有 WebSocket，直接返回 True
-            if self.exchange in ('aster', 'paradex', 'lighter', 'apex'):
-                return True
+        if not self.ws and not self.private_ws:
             logger.warning("WebSocket對象不存在，嘗試重新創建...")
             return self._recreate_websocket()
 
-        ws_connected = self.ws.is_connected()
+        ws_connected = self.ws.is_connected() if self.ws else False
 
-        if not ws_connected and not getattr(self.ws, 'reconnecting', False):
+        if self.ws and not ws_connected and not getattr(self.ws, 'reconnecting', False):
             # 檢查上次重連嘗試的時間，避免頻繁重連
             current_time = time.time()
             last_reconnect_attempt = getattr(self, '_last_reconnect_attempt', 0)
@@ -1042,15 +1044,15 @@ class MarketMaker:
                 remaining = int(reconnect_cooldown - (current_time - last_reconnect_attempt))
                 logger.debug(f"WebSocket 重連冷卻中，剩餘 {remaining} 秒")
 
+        if self.private_ws and not self.private_ws.is_connected() and not getattr(self.private_ws, 'reconnecting', False):
+            logger.debug("私有 WebSocket 連接已斷開，觸發重連...")
+            self.private_ws.check_and_reconnect_if_needed()
+
         return self.ws.is_connected() if self.ws else False
     
     def _recreate_websocket(self):
         """重新創建WebSocket連接"""
         try:
-            if self.exchange == 'aster':
-                logger.info(f"{self.exchange} 交易所不使用 WebSocket")
-                return True
-            
             # 安全關閉現有連接
             if self.ws:
                 try:
@@ -1059,8 +1061,15 @@ class MarketMaker:
                     time.sleep(0.5)
                 except Exception as e:
                     logger.debug(f"關閉現有WebSocket時的預期錯誤: {e}")
+            if self.private_ws:
+                try:
+                    self.private_ws.running = False
+                    self.private_ws.close()
+                    time.sleep(0.5)
+                except Exception as e:
+                    logger.debug(f"關閉私有WebSocket時的預期錯誤: {e}")
+            self.private_ws = None
             if self.exchange == 'backpack':
-                # 創建新的連接
                 self.ws = BackpackWebSocket(
                     self.api_key,
                     self.secret_key,
@@ -1068,9 +1077,80 @@ class MarketMaker:
                     self.on_ws_message,
                     auto_reconnect=True
                 )
-            elif self.exchange == 'xx':
-                ...
-            self.ws.connect()
+            elif self.exchange == 'aster':
+                self.ws = AsterWebSocket(
+                    api_key=self.api_key,
+                    secret_key=self.secret_key,
+                    symbol=self.symbol,
+                    enable_private=False,
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True
+                )
+                self.private_ws = AsterWebSocket(
+                    api_key=self.api_key,
+                    secret_key=self.secret_key,
+                    symbol=self.symbol,
+                    enable_private=True,
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True
+                )
+            elif self.exchange == 'paradex':
+                account_address = self.exchange_config.get('account_address') or self.api_key
+                private_key = self.exchange_config.get('private_key') or self.secret_key
+                self.ws = ParadexWebSocket(
+                    account_address=account_address,
+                    private_key=private_key,
+                    symbol=self.symbol,
+                    enable_private=True,
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True
+                )
+            elif is_lighter_exchange(self.exchange):
+                self.ws = LighterWebSocket(
+                    symbol=self.symbol,
+                    enable_private=True,
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True,
+                    exchange=self.exchange,
+                    rest_config=self.exchange_config,
+                )
+            elif self.exchange == 'apex':
+                passphrase = self.exchange_config.get('passphrase')
+                self.ws = ApexWebSocket(
+                    api_key=self.api_key,
+                    secret_key=self.secret_key,
+                    passphrase=passphrase,
+                    symbol=self.symbol,
+                    enable_private=False,
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True
+                )
+                self.private_ws = ApexWebSocket(
+                    api_key=self.api_key,
+                    secret_key=self.secret_key,
+                    passphrase=passphrase,
+                    symbol=self.symbol,
+                    enable_private=True,
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True
+                )
+            elif self.exchange == 'standx':
+                self.ws = StandxWebSocket(
+                    api_token=self.api_key,
+                    symbol=self.symbol,
+                    enable_private=True,
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True,
+                )
+            else:
+                logger.info(f"{self.exchange} 交易所未配置 WebSocket 客戶端")
+                self.ws = None
+                return False
+
+            if self.ws:
+                self.ws.connect()
+            if self.private_ws:
+                self.private_ws.connect()
             
             # 等待連接建立，但不要等太久
             wait_time = 0
@@ -1098,70 +1178,79 @@ class MarketMaker:
     
     def on_ws_message(self, stream, data):
         """處理WebSocket消息回調"""
-        if stream.startswith("account.orderUpdate."):
-            event_type = data.get('e')
-            
-            # 「訂單成交」事件
-            if event_type == 'orderFill':
-                try:
-                    side = data.get('S')
-                    quantity = float(data.get('l', '0'))
-                    price = float(data.get('L', '0'))
-                    order_id = data.get('i')
-                    maker = data.get('m', False)
-                    
-                    # 解析手續費信息（處理各種可能的字段名）
-                    fee = 0.0
-                    fee_asset = self.quote_asset
-                    fee_fields = [
-                        ('n', 'N'),  # n: fee amount, N: fee asset
-                        ('fee', 'fee_currency'),
-                        ('commission', 'commissionAsset')
-                    ]
-                    for amount_field, asset_field in fee_fields:
-                        fee_amount = data.get(amount_field)
-                        if fee_amount is not None:
-                            try:
-                                fee = float(fee_amount)
-                                fee_asset = data.get(asset_field, self.quote_asset)
-                                break
-                            except (TypeError, ValueError):
-                                continue
-                    
-                    trade_id = data.get('t')
-                    timestamp = data.get('T') or data.get('E')
+        parser_ws = self.ws or self.private_ws
+        if not parser_ws:
+            return
 
-                    trade_id_str = str(trade_id) if trade_id is not None else None
-                    timestamp_int = None
-                    if timestamp is not None:
-                        try:
-                            timestamp_int = int(timestamp)
-                        except (TypeError, ValueError):
-                            timestamp_int = None
+        try:
+            # 使用 WS 私有頻道成交回報（所有交易所統一）
+            fill_data = None
+            if hasattr(parser_ws, "_handle_fill_message"):
+                fill_data = parser_ws._handle_fill_message(data)
 
-                    logger.info(
-                        f"WebSocket 成交通知: {'買' if side == 'BUY' else '賣'}單成交 "
-                        f"{quantity} @ {price}, "
-                        f"{'Maker' if maker else 'Taker'}, "
-                        f"手續費: {fee} {fee_asset}"
-                    )
+            if fill_data:
+                fill_id = getattr(fill_data, "fill_id", None)
+                timestamp = getattr(fill_data, "timestamp", None)
+                if timestamp is None:
+                    timestamp = int(time.time() * 1000)
 
-                    self._process_order_fill_event(
-                        side=side,
-                        quantity=quantity,
-                        price=price,
-                        order_id=order_id,
-                        maker=bool(maker),
-                        fee=fee,
-                        fee_asset=fee_asset,
-                        trade_id=trade_id_str,
-                        source=data.get('source', 'ws'),
-                        timestamp=timestamp_int,
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"處理訂單成交消息時出錯: {e}")
-                    traceback.print_exc()
+                if self._has_seen_fill(fill_id, timestamp):
+                    return
+
+                quantity = float(getattr(fill_data, "quantity", 0) or 0)
+                price = float(getattr(fill_data, "price", 0) or 0)
+                if quantity <= 0 or price <= 0:
+                    return
+
+                maker_flag = getattr(fill_data, "is_maker", None)
+                maker = bool(maker_flag) if maker_flag is not None else True
+
+                self._process_order_fill_event(
+                    side=getattr(fill_data, "side", ""),
+                    quantity=quantity,
+                    price=price,
+                    order_id=getattr(fill_data, "order_id", None),
+                    maker=maker,
+                    fee=float(getattr(fill_data, "fee", 0) or 0),
+                    fee_asset=getattr(fill_data, "fee_asset", None) or self.quote_asset,
+                    trade_id=fill_id,
+                    source='ws',
+                    timestamp=int(timestamp) if timestamp is not None else None,
+                )
+                return
+
+            order_update = None
+            if hasattr(parser_ws, "_handle_order_update_message"):
+                order_update = parser_ws._handle_order_update_message(data)
+
+            if order_update and str(order_update.status or "").upper() == "FILLED":
+                order_id = getattr(order_update, "order_id", None)
+                if order_id and order_id in self._processed_ws_order_ids:
+                    return
+                if order_id:
+                    self._processed_ws_order_ids.add(order_id)
+
+                quantity = float(getattr(order_update, "filled_quantity", None) or getattr(order_update, "quantity", 0) or 0)
+                price = float(getattr(order_update, "price", 0) or 0)
+                if quantity <= 0 or price <= 0:
+                    return
+
+                self._process_order_fill_event(
+                    side=getattr(order_update, "side", ""),
+                    quantity=quantity,
+                    price=price,
+                    order_id=order_id,
+                    maker=True,
+                    fee=0.0,
+                    fee_asset=self.quote_asset,
+                    trade_id=order_id,
+                    source='ws',
+                    timestamp=getattr(order_update, "timestamp", None),
+                )
+
+        except Exception as e:
+            logger.error(f"處理 WebSocket 成交消息時出錯: {e}")
+            traceback.print_exc()
     
     def on_order_update(self, order_data):
         """處理所有交易所的訂單更新消息 - 統一接口"""
@@ -1483,6 +1572,15 @@ class MarketMaker:
         price = None
         if self.ws and self.ws.is_connected():
             price = self.ws.get_current_price()
+            last_update = max(
+                getattr(self.ws, "last_ticker_update", 0.0),
+                getattr(self.ws, "last_depth_update", 0.0),
+            )
+            if last_update and (time.time() - last_update) > self.ws_data_stale_seconds:
+                if time.time() - self._last_ws_stale_log_ts > 10:
+                    logger.warning("WebSocket 價格資料過久未更新，改用 REST 價格")
+                    self._last_ws_stale_log_ts = time.time()
+                price = None
         
         if price is None:
             ticker_response = self.client.get_ticker(self.symbol)
@@ -1503,6 +1601,15 @@ class MarketMaker:
         bid_price, ask_price = None, None
         if self.ws and self.ws.is_connected():
             bid_price, ask_price = self.ws.get_bid_ask()
+            last_update = max(
+                getattr(self.ws, "last_depth_update", 0.0),
+                getattr(self.ws, "last_ticker_update", 0.0),
+            )
+            if last_update and (time.time() - last_update) > self.ws_data_stale_seconds:
+                if time.time() - self._last_ws_stale_log_ts > 10:
+                    logger.warning("WebSocket 深度資料過久未更新，改用 REST 訂單簿")
+                    self._last_ws_stale_log_ts = time.time()
+                bid_price, ask_price = None, None
         
         if bid_price is None or ask_price is None:
             orderbook_response = self.client.get_order_book(self.symbol)
@@ -1773,38 +1880,22 @@ class MarketMaker:
     
     def subscribe_order_updates(self):
         """訂閲訂單更新流"""
-        if not self.ws or not self.ws.is_connected():
+        ws_target = self.private_ws or self.ws
+        if not ws_target or not ws_target.is_connected():
             logger.warning("無法訂閲訂單更新：WebSocket連接不可用")
             return False
-        
-        # 嘗試訂閲訂單更新流
-        stream = f"account.orderUpdate.{self.symbol}"
-        if stream not in self.ws.subscriptions:
-            retry_count = 0
-            max_retries = 3
+
+        try:
+            success = ws_target.subscribe_order_updates()
+        except Exception as e:
+            logger.error(f"訂閲訂單更新時發生異常: {e}")
             success = False
-            
-            while retry_count < max_retries and not success:
-                try:
-                    success = self.ws.private_subscribe(stream)
-                    if success:
-                        logger.info(f"成功訂閲訂單更新: {stream}")
-                        return True
-                    else:
-                        logger.warning(f"訂閲訂單更新失敗，嘗試重試... ({retry_count+1}/{max_retries})")
-                except Exception as e:
-                    logger.error(f"訂閲訂單更新時發生異常: {e}")
-                
-                retry_count += 1
-                if retry_count < max_retries:
-                    time.sleep(1)  # 重試前等待
-            
-            if not success:
-                logger.error(f"在 {max_retries} 次嘗試後仍無法訂閲訂單更新")
-                return False
+
+        if success:
+            logger.info("成功訂閲訂單更新")
         else:
-            logger.info(f"已經訂閲了訂單更新: {stream}")
-            return True
+            logger.info("訂單更新頻道不可用或訂閲失敗（可能為公共 WS 限制）")
+        return success
     
     def place_limit_orders(self):
         """下限價單（使用總餘額包含抵押品）"""
@@ -1897,7 +1988,8 @@ class MarketMaker:
                 logger.error(f"買單失敗: {res.error_message}")
             else:
                 logger.info(f"買單成功: 價格 {p_used}, 數量 {qty}")
-                self.active_buy_orders.append(res.raw)
+                if res.data:
+                    self.active_buy_orders.append(res.data)
                 self.orders_placed += 1
                 buy_order_count += 1
 
@@ -1943,7 +2035,8 @@ class MarketMaker:
                 logger.error(f"賣單失敗: {res.error_message}")
             else:
                 logger.info(f"賣單成功: 價格 {p_used}, 數量 {qty}")
-                self.active_sell_orders.append(res.raw)
+                if res.data:
+                    self.active_sell_orders.append(res.data)
                 self.orders_placed += 1
                 sell_order_count += 1
             
@@ -1980,7 +2073,7 @@ class MarketMaker:
                     
                     # 提交取消訂單任務
                     for order_info in open_orders:
-                        order_id = order_info.order_id if hasattr(order_info, 'order_id') else order_info.get('id')
+                        order_id = getattr(order_info, 'order_id', None)
                         if not order_id:
                             continue
                         
@@ -2034,14 +2127,14 @@ class MarketMaker:
         current_order_ids = set()
         if open_orders:
             for order_info in open_orders:
-                order_id = order_info.order_id if hasattr(order_info, 'order_id') else order_info.get('id')
+                order_id = getattr(order_info, 'order_id', None)
                 if order_id:
                     current_order_ids.add(order_id)
         prev_buy_orders = len(self.active_buy_orders)
         prev_sell_orders = len(self.active_sell_orders)
         filled_order_ids = []
         for order in self.active_buy_orders + self.active_sell_orders:
-            order_id = order.get('id') if isinstance(order, dict) else getattr(order, 'order_id', None)
+            order_id = getattr(order, 'order_id', None)
             if order_id and order_id not in current_order_ids:
                 filled_order_ids.append(order_id)
         filled_trades = []
@@ -2054,16 +2147,16 @@ class MarketMaker:
                     if not hasattr(self, '_processed_fill_ids'):
                         self._processed_fill_ids = set()
                     for fill in recent_fills:
-                        fill_id = fill.get('fill_id') or fill.get('id')
+                        fill_id = fill.get('fill_id')
                         fill_order_id = fill.get('order_id')
                         if fill_id in self._processed_fill_ids:
                             continue
                         if fill_order_id in filled_order_ids:
                             filled_trades.append(fill)
                             self._processed_fill_ids.add(fill_id)
-                            side = fill.get('side', '').upper()
+                            side = str(fill.get('side', '')).upper()
                             price = float(fill.get('price', 0) or 0)
-                            size = float(fill.get('quantity', 0) or fill.get('size', 0) or 0)
+                            size = float(fill.get('quantity', 0) or 0)
                             is_maker = fill.get('is_maker', True)
                             liquidity = 'MAKER' if is_maker else 'TAKER'
                             realized_pnl = fill.get('realized_pnl', 0)
@@ -2073,14 +2166,21 @@ class MarketMaker:
                             fee_currency = fill.get('fee_asset', self.quote_asset) or self.quote_asset
                             
                             # 構建完整的成交資訊
+                            if side in ('BUY', 'BID'):
+                                normalized_side = 'Bid'
+                            elif side in ('SELL', 'ASK'):
+                                normalized_side = 'Ask'
+                            else:
+                                normalized_side = 'Bid'
+
                             fill_info = {
-                                'side': 'Bid' if side == 'BUY' else 'Ask',
+                                'side': normalized_side,
                                 'quantity': size,
                                 'price': price,
                                 'maker': is_maker,
                                 'order_id': fill.get('order_id'),
                                 'client_id': fill.get('client_id'),  # APEX 使用 clientId
-                                'trade_id': fill.get('id'),
+                                'trade_id': fill_id,
                                 'realized_pnl': realized_pnl,
                                 'fee': fee,
                                 'fee_currency': fee_currency
@@ -2111,11 +2211,7 @@ class MarketMaker:
         active_sell_orders = []
         if open_orders:
             for order in open_orders:
-                # 支援 OrderInfo dataclass 或 dict
-                if hasattr(order, 'side'):
-                    side = str(order.side).upper()
-                else:
-                    side = str(order.get('side', '')).upper()
+                side = str(order.side or '').upper()
                 if side in ('BID', 'BUY'):
                     active_buy_orders.append(order)
                 elif side in ('ASK', 'SELL'):
@@ -2216,23 +2312,11 @@ class MarketMaker:
         )
 
         if self.active_buy_orders and self.active_sell_orders:
-            # 支援 dict 或 OrderInfo/OrderResult dataclass
             last_buy = self.active_buy_orders[-1]
             first_sell = self.active_sell_orders[0]
             
-            if hasattr(last_buy, 'price'):
-                buy_price = float(last_buy.price or 0)
-            elif isinstance(last_buy, dict):
-                buy_price = float(last_buy.get('price', 0) or 0)
-            else:
-                buy_price = 0
-            
-            if hasattr(first_sell, 'price'):
-                sell_price = float(first_sell.price or 0)
-            elif isinstance(first_sell, dict):
-                sell_price = float(first_sell.get('price', 0) or 0)
-            else:
-                sell_price = 0
+            buy_price = float(getattr(last_buy, 'price', 0) or 0)
+            sell_price = float(getattr(first_sell, 'price', 0) or 0)
             
             spread = sell_price - buy_price
             spread_pct = (spread / buy_price * 100) if buy_price > 0 else 0
@@ -2476,25 +2560,22 @@ class MarketMaker:
         # 如果使用 Websea，不需要 WebSocket 數據流
         if self.ws is None:
             return
-        
-        # 構建完整的頻道名稱（包含 symbol）
-        depth_channel = f"depth.{self.symbol}"
-        ticker_channel = f"bookTicker.{self.symbol}"
-        order_update_channel = f"account.orderUpdate.{self.symbol}"
-            
+
+        ticker_channel, depth_channel, order_update_channel = self._get_ws_channel_names()
+
         # 檢查深度流訂閲
-        if depth_channel not in self.ws.subscriptions:
+        if depth_channel and not self._is_ws_channel_subscribed(depth_channel):
             logger.info("重新訂閲深度數據流...")
             self.ws.initialize_orderbook()  # 重新初始化訂單簿
             self.ws.subscribe_depth()
-        
+
         # 檢查行情數據訂閲
-        if ticker_channel not in self.ws.subscriptions:
+        if ticker_channel and not self._is_ws_channel_subscribed(ticker_channel):
             logger.info("重新訂閲行情數據...")
-            self.ws.subscribe_bookTicker()
-        
+            self.ws.subscribe_ticker()
+
         # 檢查私有訂單更新流
-        if order_update_channel not in self.ws.subscriptions:
+        if order_update_channel and not self._has_private_subscription(order_update_channel):
             logger.info("重新訂閲私有訂單更新流...")
             self.subscribe_order_updates()
 
@@ -2549,21 +2630,18 @@ class MarketMaker:
             # 先確保 WebSocket 連接可用
             connection_status = self.check_ws_connection()
             if connection_status and self.ws is not None:
-                # 構建完整的頻道名稱
-                depth_channel = f"depth.{self.symbol}"
-                ticker_channel = f"bookTicker.{self.symbol}"
-                order_update_channel = f"account.orderUpdate.{self.symbol}"
-                
+                ticker_channel, depth_channel, order_update_channel = self._get_ws_channel_names()
+
                 # 初始化訂單簿和數據流
                 if not self.ws.orderbook["bids"] and not self.ws.orderbook["asks"]:
                     self.ws.initialize_orderbook()
-                
+
                 # 檢查並確保所有數據流訂閲
-                if depth_channel not in self.ws.subscriptions:
+                if depth_channel and not self._is_ws_channel_subscribed(depth_channel):
                     self.ws.subscribe_depth()
-                if ticker_channel not in self.ws.subscriptions:
-                    self.ws.subscribe_bookTicker()
-                if order_update_channel not in self.ws.subscriptions:
+                if ticker_channel and not self._is_ws_channel_subscribed(ticker_channel):
+                    self.ws.subscribe_ticker()
+                if order_update_channel and not self._has_private_subscription(order_update_channel):
                     self.subscribe_order_updates()
             
             while time.time() - start_time < duration_seconds and not self._stop_flag:
@@ -2584,7 +2662,7 @@ class MarketMaker:
                 self.check_order_fills()
 
                 # 透過 REST API 同步最新成交
-                if self.exchange in ('aster', 'lighter', 'apex'):
+                if (self.exchange in ('aster', 'apex', 'standx') or is_lighter_exchange(self.exchange)) and self.ws is None:
                     self._sync_fill_history()
 
                 # 檢查是否需要重平衡倉位
@@ -2692,6 +2770,8 @@ class MarketMaker:
             # 關閉 WebSocket
             if self.ws:
                 self.ws.close()
+            if self.private_ws:
+                self.private_ws.close()
             
             # 關閉數據庫連接
             if self.db:

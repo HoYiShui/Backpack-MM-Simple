@@ -33,6 +33,16 @@ from .base_client import (
 )
 from .proxy_utils import get_proxy_config
 from logger import setup_logger
+from utils.lighter_config import (
+    LIGHTER_BASE_URL,
+    LIGHTER_EXCHANGE,
+    LIGHTER_ROBINHOOD_CHAIN_ID,
+    LIGHTER_ROBINHOOD_EXCHANGE,
+    apply_lighter_defaults,
+    get_lighter_account_index as resolve_lighter_account_index,
+    infer_lighter_chain_id,
+    normalize_lighter_exchange,
+)
 
 logger = setup_logger("api.lighter_client")
 
@@ -116,7 +126,11 @@ class SimpleSignerClient:
         self._nonce_lock = threading.Lock()
         self.session = session or requests.Session()
         self.private_key = self._sanitize_private_key(private_key)
-        self.chain_id = int(chain_id) if chain_id is not None else (304 if "mainnet" in self.base_url else 300)
+        self.chain_id = (
+            int(chain_id)
+            if chain_id is not None
+            else infer_lighter_chain_id(self.base_url)
+        )
 
         self.signer = self._load_library(signer_dir)
         self._configure_library()
@@ -551,32 +565,27 @@ class SimpleSignerClient:
 def _compact_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in data.items() if value is not None}
 
-def _get_lihgter_account_index(address):
-    # 通過錢包地址查找主賬户
-    from eth_utils import to_checksum_address
-    import requests
+def get_lighter_account_index(address: str, base_url: str = LIGHTER_BASE_URL) -> int:
+    """Resolve an account index on the selected Lighter deployment."""
+    return resolve_lighter_account_index(address, base_url)
 
-    # 轉換為 EIP-55 校驗格式
-    checksum_address = to_checksum_address(address.lower())
-    url = 'https://mainnet.zklighter.elliot.ai/api/v1/account?by=l1_address&value='
-    full_url = url + checksum_address
 
-    res = requests.get(full_url)
-    data = res.json()
-
-    # 提取 account_index
-    if 'accounts' in data:
-        account_index = data['accounts'][0]['account_index']
-        return int(account_index)
-    else:
-        raise ValueError(f"Account not found for address: {address}")
+def _get_lihgter_account_index(address: str, base_url: str = LIGHTER_BASE_URL) -> int:
+    """Backward-compatible wrapper for the historically misspelled helper."""
+    return get_lighter_account_index(address, base_url)
     
 class LighterClient(BaseExchangeClient):
     """HTTP-based Lighter exchange adapter compatible with the strategy layer."""
 
     def __init__(self, config: Dict[str, Any]):
+        deployment = normalize_lighter_exchange(config.get("deployment"))
+        if deployment is None and infer_lighter_chain_id(config.get("base_url")) == LIGHTER_ROBINHOOD_CHAIN_ID:
+            deployment = LIGHTER_ROBINHOOD_EXCHANGE
+        deployment = deployment or LIGHTER_EXCHANGE
+        config = apply_lighter_defaults(deployment, config)
         super().__init__(config)
-        self.base_url: str = (config.get("base_url") or "https://mainnet.lighter.xyz").rstrip("/")
+        self.deployment = deployment
+        self.base_url: str = str(config["base_url"]).rstrip("/")
         self.verify_ssl: bool = bool(config.get("verify_ssl", True))
         self.timeout: float = float(config.get("timeout", DEFAULT_HTTP_TIMEOUT) or DEFAULT_HTTP_TIMEOUT)
         self.session = requests.Session()
@@ -602,12 +611,14 @@ class LighterClient(BaseExchangeClient):
         self._market_id_map: Dict[int, Dict[str, Any]] = {}
         self._allow_fee_rate_inference: bool = bool(config.get("allow_fee_rate_inference", False))
 
-        self.account_index: Optional[int] = self._as_int(
-            config.get("account_index")
-            or config.get("accountIndex")
-            or config.get("account_id")
-            or config.get("accountId")
-        )
+        account_index_value = config.get("account_index")
+        if account_index_value is None:
+            account_index_value = config.get("accountIndex")
+        if account_index_value is None:
+            account_index_value = config.get("account_id")
+        if account_index_value is None:
+            account_index_value = config.get("accountId")
+        self.account_index: Optional[int] = self._as_int(account_index_value)
         self.api_key_index: int = self._as_int(config.get("api_key_index") or config.get("apiKeyIndex") or 0, default=0)
         self.private_key: Optional[str] = (
             config.get("api_private_key")
@@ -615,7 +626,10 @@ class LighterClient(BaseExchangeClient):
             or config.get("api_key")
         )
         self.signer_dir: Optional[str] = config.get("signer_lib_dir")
-        self.chain_id: Optional[int] = self._as_int(config.get("chain_id"))
+        self.chain_id: Optional[int] = self._as_int(
+            config.get("chain_id"),
+            default=infer_lighter_chain_id(self.base_url),
+        )
 
         self.auth_token_ttl: int = max(self._as_int(config.get("auth_token_ttl"), default=600) or 600, 120)
 
@@ -641,6 +655,8 @@ class LighterClient(BaseExchangeClient):
             pass
 
     def get_exchange_name(self) -> str:
+        if self.deployment == LIGHTER_ROBINHOOD_EXCHANGE:
+            return "Lighter Robinhood"
         return "Lighter"
 
     # ---- HTTP helpers ----------------------------------------------------------
@@ -879,7 +895,7 @@ class LighterClient(BaseExchangeClient):
         quote_asset = (
             (override.get("quote_asset") if override else None)
             or item.get("quote_asset")
-            or "USDT"
+            or "USDC"
         )
         market_type = (override.get("market_type") if override else None) or item.get("market_type") or "PERP"
         status = (override.get("status") if override else None) or item.get("status") or "TRADING"
@@ -1144,6 +1160,11 @@ class LighterClient(BaseExchangeClient):
         return ApiResponse.ok(order_book, raw=payload)
 
     def get_ticker(self, symbol: str) -> ApiResponse:
+        """獲取交易對的即時行情資訊
+        
+        【重要】使用買一/賣一的中間價作為最新價格，確保價格是即時更新的。
+        緩存的 last_price 只用於回退，因為緩存數據只在程式啟動時獲取一次，之後不會更新。
+        """
         book_response = self.get_order_book(symbol, limit=50)
         if not book_response.success:
             return book_response
@@ -1155,10 +1176,21 @@ class LighterClient(BaseExchangeClient):
         best_bid = bids[0].price if bids else None
         best_ask = asks[0].price if asks else None
 
-        market = self._lookup_market(symbol)
-        last_price = market.get("last_price") if market else None
-        if last_price is None:
-            last_price = best_bid or best_ask
+        # 【修正】優先使用買一/賣一的中間價作為最新價格（即時價格）
+        # 緩存的 last_price 只在啟動時獲取一次，之後不會更新，會導致價格判斷錯誤
+        if best_bid is not None and best_ask is not None:
+            # 有買賣盤時使用中間價
+            last_price = (best_bid + best_ask) / 2
+        elif best_bid is not None:
+            # 只有買盤時使用買一價
+            last_price = best_bid
+        elif best_ask is not None:
+            # 只有賣盤時使用賣一價
+            last_price = best_ask
+        else:
+            # 完全沒有盤口數據時，回退使用緩存的價格
+            market = self._lookup_market(symbol)
+            last_price = market.get("last_price") if market else None
 
         ticker = TickerInfo(
             symbol=symbol,
@@ -1214,7 +1246,7 @@ class LighterClient(BaseExchangeClient):
             account_value=total_asset_value,
             raw=account,
         )
-        return ApiResponse.ok(collateral_info, raw=account)
+        return ApiResponse.ok([collateral_info], raw=account)
 
     def execute_order_batch(self, orders_details: List[Dict[str, Any]]) -> ApiResponse:
         """批量執行訂單
@@ -1645,12 +1677,13 @@ class LighterClient(BaseExchangeClient):
                         raw["order_id"] = exchange_order_id
                         raw["client_order_index"] = client_order_index
                         return ApiResponse.ok(OrderResult(
+                            success=True,
                             order_id=exchange_order_id,  # 使用交易所訂單 ID
                             client_order_id=str(client_order_index),  # 保留 clientOrderIndex
                             symbol=symbol,
                             side="Ask" if is_ask else "Bid",
                             price=order.price,
-                            size=order.quantity,
+                            size=order.size,
                             status=order.status or "pending",
                             raw=raw,
                         ), raw=raw)
@@ -2052,14 +2085,52 @@ class LighterClient(BaseExchangeClient):
         payload: Dict[str, Any],
         symbol: str,
     ) -> Dict[str, Any]:
-        order_id = payload.get("order_id") or payload.get("order_index")
-        client_order_index = payload.get("client_order_index") or payload.get("order_index")
+        order_index = (
+            payload.get("order_index")
+            if payload.get("order_index") is not None
+            else payload.get("orderIndex")
+            if payload.get("orderIndex") is not None
+            else payload.get("i")
+        )
+        client_order_index = (
+            payload.get("client_order_index")
+            if payload.get("client_order_index") is not None
+            else payload.get("clientOrderIndex")
+            if payload.get("clientOrderIndex") is not None
+            else payload.get("u")
+        )
+        order_id = (
+            payload.get("order_id")
+            or payload.get("orderId")
+            or payload.get("id")
+            or order_index
+        )
+        client_order_id = (
+            payload.get("client_order_id")
+            or payload.get("clientOrderId")
+            or client_order_index
+        )
+
         price = self._safe_float(payload.get("price"))
+        if price is None:
+            price = self._safe_float(payload.get("p"))
+        if price is None:
+            price = self._safe_float(payload.get("base_price") or payload.get("basePrice"))
+
         remaining = self._safe_float(payload.get("remaining_base_amount"))
+        if remaining is None:
+            remaining = self._safe_float(payload.get("rs"))
+
         initial = self._safe_float(payload.get("initial_base_amount"))
+        if initial is None:
+            initial = self._safe_float(payload.get("is"))
+
+        filled_raw = self._safe_float(payload.get("filled_base_amount"))
+        if filled_raw is None:
+            filled_raw = self._safe_float(payload.get("fb"))
 
         if remaining is None and initial is not None:
-            remaining = max(initial - (self._safe_float(payload.get("filled_base_amount")) or 0.0), 0.0)
+            remaining = max(initial - (filled_raw or 0.0), 0.0)
         if initial is None:
             initial = remaining
 
@@ -2068,28 +2139,64 @@ class LighterClient(BaseExchangeClient):
             filled_amount = max(initial - remaining, 0.0)
 
         trigger_price = self._safe_float(payload.get("trigger_price"))
+        if trigger_price is None:
+            trigger_price = self._safe_float(payload.get("tp"))
+
+        is_ask_raw = payload.get("is_ask")
+        if is_ask_raw is None:
+            is_ask_raw = payload.get("ia")
+        side_raw = payload.get("side")
+        is_ask = self._as_bool(is_ask_raw)
+        if is_ask is None and side_raw is not None:
+            side_upper = str(side_raw).strip().upper()
+            if side_upper in ("ASK", "SELL", "SELL_SHORT", "SHORT"):
+                is_ask = True
+            elif side_upper in ("BID", "BUY", "BUY_LONG", "LONG"):
+                is_ask = False
+        side = "Ask" if is_ask is True else "Bid" if is_ask is False else side_raw
+
+        status = payload.get("status") if payload.get("status") is not None else payload.get("st")
+        order_type = payload.get("type") if payload.get("type") is not None else payload.get("ot")
+        time_in_force = (
+            payload.get("time_in_force")
+            if payload.get("time_in_force") is not None
+            else payload.get("f")
+        )
+        reduce_only_raw = payload.get("reduce_only")
+        if reduce_only_raw is None:
+            reduce_only_raw = payload.get("ro")
+        reduce_only = self._as_bool(reduce_only_raw)
+        order_expiry = (
+            payload.get("order_expiry")
+            if payload.get("order_expiry") is not None
+            else payload.get("e")
+        )
+        timestamp = payload.get("timestamp") if payload.get("timestamp") is not None else payload.get("t")
+        tx_hash = payload.get("tx_hash") if payload.get("tx_hash") is not None else payload.get("txHash")
 
         return {
             "id": str(order_id) if order_id is not None else None,
             "orderId": str(order_id) if order_id is not None else None,
-            "orderIndex": payload.get("order_index"),
-            "clientOrderId": str(client_order_index) if client_order_index is not None else None,
+            "orderIndex": order_index,
+            "order_index": order_index,
+            "clientOrderId": str(client_order_id) if client_order_id is not None else None,
             "clientOrderIndex": client_order_index,
+            "client_order_index": client_order_index,
             "symbol": symbol,
             "price": price,
             "quantity": remaining,
             "remainingQuantity": remaining,
             "origQty": initial,
             "executedQty": filled_amount,
-            "status": payload.get("status"),
-            "side": "Ask" if payload.get("is_ask") else "Bid",
-            "type": payload.get("type"),
-            "timeInForce": payload.get("time_in_force"),
-            "reduceOnly": payload.get("reduce_only"),
+            "status": status,
+            "side": side,
+            "type": order_type,
+            "timeInForce": time_in_force,
+            "reduceOnly": reduce_only,
             "triggerPrice": trigger_price,
-            "orderExpiry": payload.get("order_expiry"),
-            "timestamp": payload.get("timestamp"),
-            "txHash": payload.get("tx_hash"),
+            "orderExpiry": order_expiry,
+            "timestamp": timestamp,
+            "txHash": tx_hash,
         }
 
     def _normalize_trade_record(self, trade: Dict[str, Any]) -> Dict[str, Any]:
@@ -2219,3 +2326,15 @@ class LighterClient(BaseExchangeClient):
             "timestamp": timestamp,
             "tx_hash": trade.get("tx_hash"),
         }
+
+
+class RobinhoodLighterClient(LighterClient):
+    """Lighter adapter pinned to the Robinhood Chain deployment."""
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(
+            apply_lighter_defaults(
+                LIGHTER_ROBINHOOD_EXCHANGE,
+                config or {},
+            )
+        )
