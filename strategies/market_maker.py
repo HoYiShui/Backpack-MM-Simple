@@ -17,6 +17,7 @@ from ws_client import (
     LighterWebSocket,
     ApexWebSocket,
     StandxWebSocket,
+    HyperliquidWebSocket,
 )
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility, format_quantity
@@ -174,6 +175,19 @@ class MarketMaker:
         # WebSocket 重連冷卻時間追蹤
         self._last_reconnect_attempt = 0
 
+        # 成交去重狀態必須在 WebSocket 啟動前存在，避免連線建立後的
+        # 第一批事件與初始化流程競態。
+        self._fill_history_bootstrapped = False
+        self._processed_fill_ids: Set[str] = set()
+        self._recent_fill_ids: Deque[str] = deque(maxlen=500)
+        self._last_fill_timestamp: int = 0
+        self._processed_ws_order_ids: Set[str] = set()
+
+        # Hyperliquid 的 userFills 首幀是 snapshot。先以 REST 建立基線，
+        # 再連 WebSocket，重連 snapshot 才能安全忽略。
+        if exchange == 'hyperliquid':
+            self._bootstrap_fill_history()
+
         # 添加代理參數
         # 建立 WebSocket 連接
         self.ws = None
@@ -247,6 +261,15 @@ class MarketMaker:
                 on_message_callback=self.on_ws_message,
                 auto_reconnect=True,
             )
+        elif exchange == 'hyperliquid':
+            self.ws = HyperliquidWebSocket(
+                account_address=self.exchange_config.get('account_address') or api_key,
+                symbol=symbol,
+                rest_client=self.client,
+                ws_url=self.exchange_config.get('ws_url', 'wss://api.hyperliquid-testnet.xyz/ws'),
+                on_message_callback=self.on_ws_message,
+                auto_reconnect=True,
+            )
 
         if self.ws:
             self.ws.connect()
@@ -254,13 +277,6 @@ class MarketMaker:
             self.private_ws.connect()
         # 執行緒池用於後台任務
         self.executor = ThreadPoolExecutor(max_workers=3)
-
-        # Aster REST 成交流處理狀態
-        self._fill_history_bootstrapped = False
-        self._processed_fill_ids: Set[str] = set()
-        self._recent_fill_ids: Deque[str] = deque(maxlen=500)
-        self._last_fill_timestamp: int = 0
-        self._processed_ws_order_ids: Set[str] = set()
 
         # 等待WebSocket連接建立並進行初始化訂閲
         self._initialize_websocket()
@@ -723,7 +739,7 @@ class MarketMaker:
 
     def _sync_fill_history(self, bootstrap: bool = False) -> None:
         """透過 REST API 同步最新成交"""
-        if self.exchange not in ('aster', 'apex', 'standx') and not is_lighter_exchange(self.exchange):
+        if self.exchange not in ('aster', 'apex', 'standx', 'hyperliquid') and not is_lighter_exchange(self.exchange):
             return
 
         exchange_label = self.exchange.capitalize()
@@ -738,6 +754,10 @@ class MarketMaker:
 
         fills = self._normalize_fill_history_response(response)
         if not fills:
+            # 空成交歷史也是一個有效基線。若不設置此標誌，後續第一筆
+            # 真實成交會被誤當作啟動快照而被吞掉。
+            if bootstrap or not self._fill_history_bootstrapped:
+                self._fill_history_bootstrapped = True
             return
 
         fills.sort(key=lambda item: item.get('timestamp', 0))
@@ -1142,6 +1162,15 @@ class MarketMaker:
                     on_message_callback=self.on_ws_message,
                     auto_reconnect=True,
                 )
+            elif self.exchange == 'hyperliquid':
+                self.ws = HyperliquidWebSocket(
+                    account_address=self.exchange_config.get('account_address') or self.api_key,
+                    symbol=self.symbol,
+                    rest_client=self.client,
+                    ws_url=self.exchange_config.get('ws_url', 'wss://api.hyperliquid-testnet.xyz/ws'),
+                    on_message_callback=self.on_ws_message,
+                    auto_reconnect=True,
+                )
             else:
                 logger.info(f"{self.exchange} 交易所未配置 WebSocket 客戶端")
                 self.ws = None
@@ -1222,6 +1251,12 @@ class MarketMaker:
             order_update = None
             if hasattr(parser_ws, "_handle_order_update_message"):
                 order_update = parser_ws._handle_order_update_message(data)
+
+            # Hyperliquid 同時推送 userFills（逐筆增量）與 orderUpdates
+            #（累計成交量）。成交記帳只以 userFills 為權威來源，否則完整
+            # 成交時會把前面的部分成交再累計一次。
+            if order_update and self.exchange == 'hyperliquid':
+                return
 
             if order_update and str(order_update.status or "").upper() == "FILLED":
                 order_id = getattr(order_update, "order_id", None)
@@ -2043,80 +2078,64 @@ class MarketMaker:
         logger.info(f"共下單: {buy_order_count} 個買單, {sell_order_count} 個賣單")
     
     def cancel_existing_orders(self):
-        """取消所有現有訂單"""
-        orders_response = self.client.get_open_orders(self.symbol)
-        
-        if not orders_response.success:
-            logger.error(f"獲取訂單失敗: {orders_response.error_message}")
-            return
-        
-        open_orders = orders_response.data
-        if not open_orders:
-            logger.info("沒有需要取消的現有訂單")
-            self.active_buy_orders = []
-            self.active_sell_orders = []
-            return
-        
-        logger.info(f"正在取消 {len(open_orders)} 個現有訂單")
-        
-        try:
-            # 嘗試批量取消
+        """取消本 bot 訂單，失敗時重新查詢後做有限次安全重試。"""
+
+        def bot_orders():
+            response = self.client.get_open_orders(self.symbol)
+            if not response.success:
+                logger.error("獲取訂單失敗: %s", response.error_message)
+                return None
+            orders = response.data or []
+            if hasattr(self.client, 'is_bot_cloid'):
+                orders = [
+                    order for order in orders
+                    if self.client.is_bot_cloid(getattr(order, 'client_order_id', None))
+                ]
+            return orders
+
+        success = False
+        for attempt in range(1, 4):
+            open_orders = bot_orders()
+            if open_orders is None:
+                time.sleep(0.5)
+                continue
+            if not open_orders:
+                success = True
+                break
+
+            logger.info("正在取消 %d 個現有訂單 (第 %d/3 輪)", len(open_orders), attempt)
             cancel_response = self.client.cancel_all_orders(self.symbol)
-            
-            if not cancel_response.success:
-                logger.error(f"批量取消訂單失敗: {cancel_response.error_message}")
-                logger.info("嘗試逐個取消...")
-                
-                # 初始化線程池
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    cancel_futures = []
-                    
-                    # 提交取消訂單任務
-                    for order_info in open_orders:
-                        order_id = getattr(order_info, 'order_id', None)
-                        if not order_id:
-                            continue
-                        
-                        # Use legacy wrapper to keep existing logic; could be refactored to self.client.cancel_order
-                        # Directly use instance client method now
-                        future = executor.submit(
-                            self.client.cancel_order,
-                            order_id,
-                            self.symbol
-                        )
-                        cancel_futures.append((order_id, future))
-                    
-                    # 處理結果
-                    for order_id, future in cancel_futures:
-                        try:
-                            res = future.result()
-                            if not res.success:
-                                logger.error(f"取消訂單 {order_id} 失敗: {res.error_message}")
-                            else:
-                                logger.info(f"取消訂單 {order_id} 成功")
-                                self.orders_cancelled += 1
-                        except Exception as e:
-                            logger.error(f"取消訂單 {order_id} 時出錯: {e}")
-            else:
+            if cancel_response.success:
+                cancelled_count = getattr(cancel_response.data, 'cancelled_count', len(open_orders))
+                self.orders_cancelled += cancelled_count
                 logger.info("批量取消訂單成功")
-                self.orders_cancelled += len(open_orders)
-        except Exception as e:
-            logger.error(f"取消訂單過程中發生錯誤: {str(e)}")
-        
-        # 等待一下確保訂單已取消
-        time.sleep(1)
-        
-        # 檢查是否還有未取消的訂單
-        remaining_response = self.client.get_open_orders(self.symbol)
-        remaining_orders = remaining_response.data if remaining_response.success else []
-        if remaining_orders and len(remaining_orders) > 0:
-            logger.warning(f"警告: 仍有 {len(remaining_orders)} 個未取消的訂單")
-        else:
+            else:
+                logger.error("批量取消訂單失敗: %s", cancel_response.error_message)
+                logger.info("改為順序逐個取消，避免 signer nonce 碰撞...")
+                for order_info in open_orders:
+                    order_id = getattr(order_info, 'order_id', None)
+                    if not order_id:
+                        continue
+                    result = self.client.cancel_order(order_id, self.symbol)
+                    if result.success:
+                        self.orders_cancelled += 1
+                        logger.info("取消訂單 %s 成功", order_id)
+                    else:
+                        logger.error("取消訂單 %s 失敗: %s", order_id, result.error_message)
+                    time.sleep(0.1)
+            time.sleep(0.75)
+
+        if not success:
+            remaining = bot_orders()
+            success = remaining == []
+            if remaining:
+                logger.warning("警告: 3 輪後仍有 %d 個未取消的 bot 訂單", len(remaining))
+        if success:
             logger.info("所有訂單已成功取消")
-        
-        # 重置活躍訂單列表
+
         self.active_buy_orders = []
         self.active_sell_orders = []
+        return success
     
     def check_order_fills(self):
         orders_response = self.client.get_open_orders(self.symbol)
@@ -2766,6 +2785,13 @@ class MarketMaker:
         finally:
             logger.info("取消所有未成交訂單...")
             self.cancel_existing_orders()
+
+            if self.exchange_config.get('close_on_exit') and hasattr(self, 'close_position'):
+                logger.warning("close_on_exit 已啟用，退出前執行 reduce-only 市價平倉...")
+                try:
+                    self.close_position(order_type="Market")
+                except Exception as exc:
+                    logger.error("退出前平倉失敗: %s", exc)
             
             # 關閉 WebSocket
             if self.ws:

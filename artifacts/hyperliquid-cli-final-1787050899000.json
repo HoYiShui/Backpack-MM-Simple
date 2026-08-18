@@ -1,0 +1,47 @@
+{
+  "schema": "hyperliquid-testnet-cli-validation-v1",
+  "network": "testnet",
+  "entrypoint": "run.py",
+  "symbol": "BTC",
+  "started_ms": 1787050899000,
+  "started_utc": "2026-08-18T11:01:39+00:00",
+  "ended_ms": 1787051515000,
+  "ended_utc": "2026-08-18T11:11:55+00:00",
+  "runtime_seconds_reported_by_cli": 603,
+  "parameters": {
+    "quantity_btc": "0.001",
+    "grid_num": 6,
+    "price_range_percent": "0.02",
+    "max_position_btc": "0.003",
+    "max_order_notional_usdc": "100",
+    "close_on_exit": true
+  },
+  "checks": {
+    "process_exit_code": 0,
+    "runtime_at_least_10_minutes": true,
+    "fill_count_including_exit_close": 18,
+    "unique_l1_hash_count": 11,
+    "sides": ["BUY", "SELL"],
+    "directions": ["Close Long", "Close Short", "Open Long", "Open Short"],
+    "total_fill_size_btc": "0.01342",
+    "risk_limit_api_rejections": 0,
+    "bot_open_orders_after_cleanup": 0,
+    "positions_after_cleanup": 0,
+    "exit_position_btc": "-0.003",
+    "exit_close_chunks_btc": ["0.0015", "0.0015"],
+    "final_usdc_balance": "997.553204"
+  },
+  "l1_hashes": [
+    "0x01729b95a3d33b1c02ec042727bb04010900b37b3ed659eea53b46e862d71506",
+    "0x0611503ba10b0b37078b042727bb4800004c68213c0e2a09a9d9fb8e600ee521",
+    "0x342979779c1fca6335a3042727bd26010300915d3712e935d7f224ca5b13a44d",
+    "0x38ff3905068ed66e3a78042727dd5901030050eaa181f540dcc7e457c582b058",
+    "0x3be0b6853a5ecd7e3d5a042727bc8c010900ce6ad551ec50dfa961d7f952a768",
+    "0x44c8bede40fe4a254642042727bc0a010d00d6c3dbf168f7e8916a30fff2240f",
+    "0x8bb61fb38cbb43168d2f042727bb1f0000f1379927be61e82f7ecb064bbf1d01",
+    "0xc1cccf2fc13bca59c346042727bac6010500e7155c3ee92b65957a82803fa444",
+    "0xc44c5ac7135eef14c5c6042727bb7601070072acae520de668150619d252c8ff",
+    "0xd333d3472f123b61d4ad042727dd3d00006eeb2cca155a3376fc7e99ee16154c",
+    "0xff18993808bdc2240092042727bddf000053b11da3b0e0f7a2e1448ac7b19c0f"
+  ]
+}

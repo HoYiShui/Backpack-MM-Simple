@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 
 # 載入環境變數
 load_dotenv()
+# Hyperliquid credentials live in a dedicated, git-ignored file. Existing
+# process environment variables always take precedence.
+load_dotenv('.env.hyperliquid', override=False)
 
 # ==================== 通用配置 ====================
 
@@ -99,6 +102,17 @@ STANDX_PRIVATE_KEY = os.getenv('STANDX_PRIVATE_KEY') or os.getenv('STANDX_SIGNIN
 # StandX API 端點
 STANDX_BASE_URL = os.getenv('STANDX_BASE_URL', 'https://perps.standx.com')
 STANDX_WS_URL = os.getenv('STANDX_WS_URL', 'wss://perps.standx.com/ws-stream/v1')
+
+# ==================== Hyperliquid 配置 ====================
+
+HYPERLIQUID_REST_URL = os.getenv('HYPERLIQUID_REST_URL', 'https://api.hyperliquid-testnet.xyz')
+HYPERLIQUID_WS_URL = os.getenv('HYPERLIQUID_WS_URL', 'wss://api.hyperliquid-testnet.xyz/ws')
+HYPERLIQUID_ACCOUNT_ADDRESS = os.getenv('HYPERLIQUID_ACCOUNT_ADDRESS', '')
+HYPERLIQUID_SIGNER_ADDRESS = os.getenv('HYPERLIQUID_SIGNER_ADDRESS', '')
+HYPERLIQUID_SIGNER_PRIVATE_KEY = os.getenv('HYPERLIQUID_SIGNER_PRIVATE_KEY', '')
+HYPERLIQUID_VAULT_ADDRESS = os.getenv('HYPERLIQUID_VAULT_ADDRESS', '')
+HYPERLIQUID_MAX_ORDER_NOTIONAL = os.getenv('HYPERLIQUID_MAX_ORDER_NOTIONAL', '100')
+HYPERLIQUID_MAX_ACTIVE_ORDERS = int(os.getenv('HYPERLIQUID_MAX_ACTIVE_ORDERS', '30'))
 
 # ==================== 向後兼容性（保留舊變數名） ====================
 # 注意：這些變數已被標記為 Deprecated，建議使用上面的 BACKPACK_ 前綴變數

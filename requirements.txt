@@ -10,3 +10,4 @@ python-socketio
 werkzeug
 apexomni
 python-telegram-bot>=20.0
+hyperliquid-python-sdk==0.24.0

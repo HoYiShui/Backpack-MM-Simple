@@ -42,6 +42,7 @@ from .aster_client import AsterClient
 from .lighter_client import LighterClient, RobinhoodLighterClient  # 輕量依賴，可安全頂層導入
 from .apex_client import ApexClient
 from .standx_client import StandxClient
+from .hyperliquid_client import HyperliquidClient
 
 __all__ = [
     # 基礎類別
@@ -53,6 +54,7 @@ __all__ = [
     "RobinhoodLighterClient",
     "ApexClient",
     "StandxClient",
+    "HyperliquidClient",
     # 標準化響應
     "ApiResponse",
     # 訂單相關
@@ -98,6 +100,8 @@ def get_client(name: str, *args, **kwargs):
         return ApexClient(*args, **kwargs)
     elif name == "standx":
         return StandxClient(*args, **kwargs)
+    elif name in ("hyperliquid", "hl"):
+        return HyperliquidClient(*args, **kwargs)
     else:
         raise ValueError(f"未知交易所: {name}")
 

@@ -561,6 +561,29 @@ class PerpetualMarketMaker(MarketMaker):
             logger.info("平倉數量 %s 低於最小單位，忽略", format_balance(qty))
             return False
 
+        close_chunks = [qty]
+        max_order_notional = float(getattr(self.client, 'max_order_notional', 0) or 0)
+        if order_type.lower() == "market" and max_order_notional > 0:
+            current_price = self.get_current_price()
+            if current_price and qty * current_price > max_order_notional:
+                # Keep a small buffer because the adapter validates market
+                # orders against a fresh mid price. Equal-sized chunks avoid
+                # creating an under-notional remainder at the end.
+                safe_notional = max_order_notional * 0.99
+                chunk_count = max(2, math.ceil(qty * current_price / safe_notional))
+                base_chunk = round_to_precision(qty / chunk_count, self.base_precision)
+                close_chunks = [base_chunk] * (chunk_count - 1)
+                close_chunks.append(
+                    round_to_precision(qty - base_chunk * (chunk_count - 1), self.base_precision)
+                )
+                if any(chunk < self.min_order_size for chunk in close_chunks):
+                    logger.error("無法在本地名義價值上限內安全分片平倉: qty=%s", format_balance(qty))
+                    return False
+                logger.warning(
+                    "平倉名義價值超過本地上限，拆分為 %d 筆 reduce-only 市價單",
+                    len(close_chunks),
+                )
+
         logger.info(
             "執行平倉: 實際倉位=%s, 平倉數量=%s, 方向=%s",
             format_balance(net),
@@ -568,27 +591,30 @@ class PerpetualMarketMaker(MarketMaker):
             direction
         )
 
-        result = self.open_position(
-            side=order_side,
-            quantity=qty,
-            price=price,
-            order_type=order_type,
-            reduce_only=True,
-            client_id=client_id,
-        )
-
-        if not result.success:
-            logger.error(
-                "平倉失敗: %s | side=%s qty=%s price=%s type=%s reduceOnly=%s clientId=%s",
-                result.error_message,
-                order_side,
-                format_balance(qty),
-                price if price is not None else "Market",
-                order_type,
-                True,
-                client_id or "",
+        for chunk_index, chunk_qty in enumerate(close_chunks, start=1):
+            result = self.open_position(
+                side=order_side,
+                quantity=chunk_qty,
+                price=price,
+                order_type=order_type,
+                reduce_only=True,
+                client_id=client_id,
             )
-            return False
+
+            if not result.success:
+                logger.error(
+                    "平倉失敗: %s | side=%s qty=%s price=%s type=%s reduceOnly=%s clientId=%s chunk=%d/%d",
+                    result.error_message,
+                    order_side,
+                    format_balance(chunk_qty),
+                    price if price is not None else "Market",
+                    order_type,
+                    True,
+                    client_id or "",
+                    chunk_index,
+                    len(close_chunks),
+                )
+                return False
 
         logger.info("平倉完成，數量 %s", format_balance(qty))
         self._update_position_state()

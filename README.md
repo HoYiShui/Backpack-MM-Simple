@@ -15,6 +15,7 @@
 | **Lighter Robinhood** | ❌ | ✅ | ✅ | ❌ | ✅ | [註冊連結](https://robinhoodchain.lighter.xyz/?referral=YANOWO) |
 | **APEX** | ❌ | ✅ | ✅ | ❌ | ✅ | [註冊連結](https://join.omni.apex.exchange/yanowo) |
 | **StandX** | ❌ | ✅ | ✅ | ❌ | ✅ | [註冊連結](https://standx.com/referral?code=yanowo) |
+| **Hyperliquid Testnet** | ❌ | ✅ | ❌ | ❌ | ✅ | [官方文檔](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api) |
 
 Twitter：[Yan Practice ⭕散修](https://x.com/practice_y11)
 
@@ -201,6 +202,8 @@ WEB_DEBUG=false
 
 ```
 ## 使用方法
+
+Hyperliquid 目前只開放 Testnet 永續網格，Mainnet 在代碼中默認禁用。配置、風控、運行命令與驗收證據格式見 [Hyperliquid Testnet 指南](docs/HYPERLIQUID_TESTNET.md)。
 
 本程序提供三種運行模式，您可以根據需求選擇：
 

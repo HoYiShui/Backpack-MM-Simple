@@ -28,7 +28,9 @@ def parse_arguments():
     parser.add_argument('--web', action='store_true', help='啟動Web界面')
     
     # 基本參數
-    parser.add_argument('--exchange', type=str, choices=['backpack', 'aster', 'paradex', 'lighter', LIGHTER_ROBINHOOD_EXCHANGE, 'apex', 'standx'], default='backpack', help='交易所選擇 (backpack、aster、paradex、lighter、lighter_robinhood、apex 或 standx)')
+    parser.add_argument('--exchange', type=str, choices=['backpack', 'aster', 'paradex', 'lighter', LIGHTER_ROBINHOOD_EXCHANGE, 'apex', 'standx', 'hyperliquid'], default='backpack', help='交易所選擇')
+    parser.add_argument('--confirm-live-testnet', action='store_true', help='顯式允許 Hyperliquid Testnet 真實下撤單')
+    parser.add_argument('--close-on-exit', action='store_true', help='退出前撤單並以 reduce-only 市價單平掉策略持倉')
     parser.add_argument('--api-key', type=str, help='API Key (可選，默認使用環境變數或配置文件)')
     parser.add_argument('--secret-key', type=str, help='Secret Key (可選，默認使用環境變數或配置文件)')
     
@@ -176,6 +178,25 @@ def main():
         }
         if session_id:
             exchange_config['session_id'] = session_id
+    elif exchange == 'hyperliquid':
+        account_address = os.getenv('HYPERLIQUID_ACCOUNT_ADDRESS', '')
+        secret_key = os.getenv('HYPERLIQUID_SIGNER_PRIVATE_KEY', '')
+        api_key = account_address
+        base_url = os.getenv('HYPERLIQUID_REST_URL', 'https://api.hyperliquid-testnet.xyz')
+        exchange_config = {
+            'account_address': account_address,
+            'signer_address': os.getenv('HYPERLIQUID_SIGNER_ADDRESS', ''),
+            'signer_private_key': secret_key,
+            'vault_address': os.getenv('HYPERLIQUID_VAULT_ADDRESS', ''),
+            'base_url': base_url,
+            'ws_url': os.getenv('HYPERLIQUID_WS_URL', 'wss://api.hyperliquid-testnet.xyz/ws'),
+            'allow_orders': bool(args.confirm_live_testnet),
+            'allow_mainnet': False,
+            'max_order_notional': os.getenv('HYPERLIQUID_MAX_ORDER_NOTIONAL', '100'),
+            'max_active_orders': int(os.getenv('HYPERLIQUID_MAX_ACTIVE_ORDERS', '30')),
+            'max_position': args.max_position,
+            'close_on_exit': bool(args.close_on_exit),
+        }
     else:
         logger.error("不支持的交易所，請選擇 'backpack'、'aster'、'paradex'、'lighter'、'lighter_robinhood'、'apex' 或 'standx'")
         sys.exit(1)
@@ -200,6 +221,13 @@ def main():
     elif exchange == 'standx':
         if not api_key or not secret_key:
             logger.error("缺少 StandX API Token 或簽名密鑰，請設置 STANDX_API_TOKEN/STANDX_JWT 與 STANDX_PRIVATE_KEY")
+            sys.exit(1)
+    elif exchange == 'hyperliquid':
+        if not account_address or not secret_key:
+            logger.error("Hyperliquid 需要 account address 和已授權 API wallet signer private key")
+            sys.exit(1)
+        if not args.confirm_live_testnet:
+            logger.error("Hyperliquid 交易默認鎖定；Testnet 下單需顯式加入 --confirm-live-testnet")
             sys.exit(1)
     else:
         if not api_key or not secret_key:

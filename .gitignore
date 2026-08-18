@@ -1,7 +1,11 @@
 *.log
 __pycache__/
 *.pyc
+.venv/
 .env
+.env.hyperliquid
+.env.hyperliquid.*
+!.env.hyperliquid.example
 *.db
 .claude/settings.local.json
 CLAUDE.md

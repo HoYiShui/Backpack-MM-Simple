@@ -466,6 +466,7 @@ class PerpGridStrategy(PerpetualMarketMaker):
         self.close_orders[normalized_id] = {
             'open_price': open_price,
             'quantity': quantity,
+            'filled_quantity': 0.0,
             'position_type': position_type,
             'alias_ids': alias_ids,
             'created_time': datetime.now(),
@@ -513,7 +514,11 @@ class PerpGridStrategy(PerpetualMarketMaker):
         
         self._remove_order_aliases(normalized_id)
     
-    def _remove_close_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+    def _remove_close_order(
+        self,
+        order_id: str,
+        preserve_position: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """移除平倉單記錄並返回相關信息
         
         Args:
@@ -536,9 +541,13 @@ class PerpGridStrategy(PerpetualMarketMaker):
         
         # 如果沒有其他平倉單，解鎖該點位
         if not state['close_order_ids']:
-            state['locked'] = False
-            state['open_position'] = 0.0
-            logger.debug("解鎖網格點位: %.4f", open_price)
+            if preserve_position:
+                # 撤單/過期後仍有未平倉位；新平倉單尚未掛出前保持鎖定。
+                state['locked'] = True
+            else:
+                state['locked'] = False
+                state['open_position'] = 0.0
+                logger.debug("解鎖網格點位: %.4f", open_price)
         
         self._remove_order_aliases(normalized_id)
         
@@ -616,6 +625,14 @@ class PerpGridStrategy(PerpetualMarketMaker):
                 logger.debug(
                     "待掛平倉量 %.8f 小於最小訂單量 %.8f，暫存等待累積",
                     qty, self.min_order_size
+                )
+                continue
+
+            min_notional = float(getattr(self.client, 'min_order_notional', 0) or 0)
+            if min_notional > 0 and qty * open_price < min_notional:
+                logger.info(
+                    "待掛平倉量 %.8f 名義價值 %.4f %s 小於交易所最低要求 %.2f，暫存等待累積",
+                    qty, qty * open_price, self.quote_asset, min_notional
                 )
                 continue
 
@@ -796,28 +813,48 @@ class PerpGridStrategy(PerpetualMarketMaker):
             side: 'Bid' 或 'Ask'
             quantity: 成交數量
         """
-        close_info = self._remove_close_order(order_id)
-        
-        if not close_info:
+        normalized_id = self._resolve_order_id(order_id) or self._normalize_order_id(order_id)
+        close_info = self.close_orders.get(normalized_id) if normalized_id else None
+
+        if not close_info or not normalized_id:
             logger.warning("平倉單 %s 不在追蹤列表中，可能已經處理過", order_id)
             return
-        
+
         open_price = close_info['open_price']
         position_type = close_info['position_type']
+        original_qty = float(close_info.get('quantity', quantity) or quantity)
+        previous_filled = float(close_info.get('filled_quantity', 0.0) or 0.0)
+        remaining_before = max(0.0, original_qty - previous_filled)
+        applied_qty = min(max(0.0, float(quantity)), remaining_before)
+        if applied_qty <= 0:
+            logger.debug("平倉單 %s 的成交已完整處理，忽略重複事件", order_id)
+            return
+        close_info['filled_quantity'] = previous_filled + applied_qty
+        is_fully_filled = close_info['filled_quantity'] >= original_qty - max(1e-12, self.min_order_size * 0.01)
         
         logger.info(
-            "平倉單成交[訂單狀態]: ID=%s, 方向=%s, 成交價格=%.4f, 數量=%.4f, 開倉價格=%.4f, 類型=%s",
-            order_id, side, price, quantity, open_price, position_type
+            "平倉單成交[訂單狀態]: ID=%s, 方向=%s, 成交價格=%.4f, 本次=%.4f, 累計=%.4f/%.4f, 類型=%s",
+            order_id, side, price, applied_qty, close_info['filled_quantity'], original_qty, position_type
         )
         
         # 計算並記錄網格利潤
         if position_type == 'long':
-            grid_profit = (price - open_price) * quantity
+            grid_profit = (price - open_price) * applied_qty
         else:
-            grid_profit = (open_price - price) * quantity
+            grid_profit = (open_price - price) * applied_qty
         
         self.grid_profit += grid_profit
+        state = self.grid_level_states[open_price]
+        if position_type == 'long':
+            state['open_position'] = max(0.0, float(state.get('open_position', 0.0)) - applied_qty)
+        else:
+            state['open_position'] = min(0.0, float(state.get('open_position', 0.0)) + applied_qty)
         logger.info("網格利潤實現: %.4f %s (累計: %.4f)", grid_profit, self.quote_asset, self.grid_profit)
+
+        if is_fully_filled:
+            self._remove_close_order(normalized_id)
+        else:
+            logger.info("平倉單部分成交，保留剩餘數量 %.8f", original_qty - close_info['filled_quantity'])
     
     # ==================== 新的核心方法：基於倉位變化的檢測 ====================
     
@@ -883,10 +920,17 @@ class PerpGridStrategy(PerpetualMarketMaker):
         
         # 檢查開倉單
         filled_open_orders = []
+        cancelled_open_orders = []
         for price, side, order_id, order_info in list(self._iter_open_orders()):
             tracked_aliases = self._collect_aliases(order_id, order_info)
             if exchange_order_ids.isdisjoint(tracked_aliases):
-                filled_open_orders.append((order_id, price, side, order_info['quantity']))
+                venue_total = self._matching_fill_quantity(order_id, order_info, fill_history)
+                if venue_total is None:
+                    continue
+                original = float(order_info.get('quantity', 0) or 0)
+                tracked = float(order_info.get('filled_quantity', 0) or 0)
+                delta = max(0.0, min(original, venue_total) - tracked)
+                filled_open_orders.append((order_id, price, side, delta, venue_total, original))
         
         # 檢查平倉單
         filled_close_orders = []
@@ -904,25 +948,34 @@ class PerpGridStrategy(PerpetualMarketMaker):
                 # Paradex 和 Aster 會取消/過期 reduceOnly 訂單，需要驗證
                 if self._requires_fill_verification():
                     if self._verify_order_filled(order_id, close_info, fill_history):
-                        filled_close_orders.append((order_id, close_info))
+                        venue_total = self._matching_fill_quantity(order_id, close_info, fill_history)
+                        if venue_total is None:
+                            continue
+                        filled_close_orders.append((order_id, close_info, venue_total))
                     else:
                         cancelled_close_orders.append((order_id, close_info))
                 else:
-                    filled_close_orders.append((order_id, close_info))
+                    filled_close_orders.append((order_id, close_info, close_info.get('quantity', 0)))
         
         # 處理發現的已成交訂單
         if filled_open_orders:
             logger.warning("發現 %d 個未被檢測的開倉單成交", len(filled_open_orders))
-            for order_id, price, side, quantity in filled_open_orders:
+            for order_id, price, side, delta, venue_total, original in filled_open_orders:
                 logger.info("補充處理開倉單成交: ID=%s, 價格=%.4f, 方向=%s", order_id, price, side)
-                self._handle_open_order_filled(order_id, price, side, quantity)
+                if delta > 0:
+                    self._handle_open_order_filled(order_id, price, side, delta)
+                if venue_total < original and self._find_open_order(order_id):
+                    # 交易所已移除部分成交訂單；只關閉已確認成交量，未成交
+                    # 餘量視為撤銷，不能補記成成交。
+                    self._remove_open_order(order_id, price, side)
         
         # 【重要】處理完開倉單後，新掛的平倉單會加入 _orders_placed_this_iteration
         # 需要過濾掉這些剛掛的訂單
         if filled_close_orders:
             original_count = len(filled_close_orders)
             filled_close_orders = [
-                (order_id, close_info) for order_id, close_info in filled_close_orders
+                (order_id, close_info, venue_total)
+                for order_id, close_info, venue_total in filled_close_orders
                 if not ({self._normalize_order_id(order_id)} | 
                        close_info.get('alias_ids', set())) & self._orders_placed_this_iteration
             ]
@@ -931,14 +984,22 @@ class PerpGridStrategy(PerpetualMarketMaker):
         
         if filled_close_orders:
             logger.warning("發現 %d 個未被檢測的平倉單成交", len(filled_close_orders))
-            for order_id, close_info in filled_close_orders:
+            for order_id, close_info, venue_total in filled_close_orders:
                 open_price = close_info['open_price']
-                quantity = close_info['quantity']
+                original = float(close_info.get('quantity', 0) or 0)
+                tracked = float(close_info.get('filled_quantity', 0) or 0)
+                quantity = max(0.0, min(original, venue_total) - tracked)
                 position_type = close_info['position_type']
                 # 平多是賣出(Ask)，平空是買入(Bid)
                 side = 'Ask' if position_type == 'long' else 'Bid'
                 logger.info("補充處理平倉單成交: ID=%s, 開倉價格=%.4f, 類型=%s", order_id, open_price, position_type)
-                self._handle_close_order_filled(order_id, open_price, side, quantity)
+                if quantity > 0:
+                    self._handle_close_order_filled(order_id, open_price, side, quantity)
+                remaining = max(0.0, original - venue_total)
+                if remaining > max(1e-12, self.min_order_size * 0.01) and order_id in self.close_orders:
+                    retry_count = close_info.get('retry_count', 0)
+                    self._remove_close_order(order_id, preserve_position=True)
+                    self._add_pending_close_order(open_price, remaining, position_type, retry_count)
         
         # 處理被取消/過期的平倉單（重新掛單）
         if cancelled_close_orders:
@@ -950,13 +1011,13 @@ class PerpGridStrategy(PerpetualMarketMaker):
                 retry_count = close_info.get('retry_count', 0)
                 
                 # 移除舊的平倉單記錄
-                self._remove_close_order(order_id)
+                self._remove_close_order(order_id, preserve_position=True)
                 
                 logger.info("重新掛平倉單（sync）: 開倉價格=%.4f, 數量=%.4f, 類型=%s, 重試次數=%d", 
                            open_price, quantity, position_type, retry_count + 1)
                 
                 # 加入待重試隊列
-                self._add_pending_close_order(open_price, quantity, position_type, retry_count + 1)
+                self._add_pending_close_order(open_price, quantity, position_type, retry_count)
 
     def _detect_filled_orders_from_exchange(self, open_orders: List, 
                                              fill_history: Optional[List] = None) -> None:
@@ -979,7 +1040,7 @@ class PerpGridStrategy(PerpetualMarketMaker):
         
         logger.info(
             "成交檢測: 交易所活躍訂單=%d, 本地追蹤: 開多=%d, 開空=%d, 平倉=%d",
-            len(exchange_order_ids), local_long_count, local_short_count, local_close_count
+            len(open_orders), local_long_count, local_short_count, local_close_count
         )
         
         # 檢查開倉單是否已成交
@@ -990,9 +1051,13 @@ class PerpGridStrategy(PerpetualMarketMaker):
             tracked_aliases = self._collect_aliases(order_id, order_info)
             if exchange_order_ids.isdisjoint(tracked_aliases):
                 qty = order_info.get('quantity', self.order_quantity) if isinstance(order_info, dict) else self.order_quantity
-                # 需要驗證成交歷史，確認是真的成交還是被取消
-                if self._verify_open_order_filled(order_id, order_info, fill_history):
-                    filled_open_orders.append((order_id, price, side, qty))
+                venue_total = self._matching_fill_quantity(order_id, order_info, fill_history)
+                if venue_total is None:
+                    continue
+                tracked = float(order_info.get('filled_quantity', 0) or 0)
+                delta = max(0.0, min(float(qty), venue_total) - tracked)
+                if venue_total > 0:
+                    filled_open_orders.append((order_id, price, side, delta, venue_total, float(qty)))
                 else:
                     cancelled_open_orders.append((order_id, price, side, qty))
         
@@ -1020,14 +1085,17 @@ class PerpGridStrategy(PerpetualMarketMaker):
                 # 這些交易所需要通過成交歷史驗證訂單是否真的成交了
                 if self._requires_fill_verification():
                     # 通過成交歷史驗證（使用預先獲取的成交歷史）
-                    if self._verify_order_filled(order_id, close_info, fill_history):
-                        filled_close_orders.append((order_id, close_info))
+                    venue_total = self._matching_fill_quantity(order_id, close_info, fill_history)
+                    if venue_total is None:
+                        continue
+                    if venue_total > 0:
+                        filled_close_orders.append((order_id, close_info, venue_total))
                     else:
                         # 訂單被取消/過期，需要重新掛單
                         cancelled_close_orders.append((order_id, close_info))
                 else:
                     # 其他交易所：直接當作成交處理（因為它們不會靜默取消訂單）
-                    filled_close_orders.append((order_id, close_info))
+                    filled_close_orders.append((order_id, close_info, close_info.get('quantity', 0)))
         
         # 處理被取消的開倉單（從追蹤中移除，記錄價格偏移信息）
         if cancelled_open_orders:
@@ -1069,10 +1137,13 @@ class PerpGridStrategy(PerpetualMarketMaker):
         # 處理已成交的開倉單
         if filled_open_orders:
             logger.info("檢測到 %d 個開倉單已成交（不在交易所活躍訂單中）", len(filled_open_orders))
-            for order_id, price, side, quantity in filled_open_orders:
+            for order_id, price, side, quantity, venue_total, original in filled_open_orders:
                 logger.info("處理開倉單成交: ID=%s, 價格=%.4f, 方向=%s, 數量=%.4f", 
                            order_id, price, side, quantity)
-                self._handle_open_order_filled(order_id, price, side, quantity)
+                if quantity > 0:
+                    self._handle_open_order_filled(order_id, price, side, quantity)
+                if venue_total < original and self._find_open_order(order_id):
+                    self._remove_open_order(order_id, price, side)
         
         # 【重要】開倉單處理完後會掛平倉單，這些新掛的訂單會加入 _orders_placed_this_iteration
         # 需要重新過濾 filled_close_orders，排除本次迭代新掛的訂單
@@ -1080,7 +1151,8 @@ class PerpGridStrategy(PerpetualMarketMaker):
             # 過濾掉本次迭代新掛的訂單
             original_count = len(filled_close_orders)
             filled_close_orders = [
-                (order_id, close_info) for order_id, close_info in filled_close_orders
+                (order_id, close_info, venue_total)
+                for order_id, close_info, venue_total in filled_close_orders
                 if not ({self._normalize_order_id(order_id)} | 
                        close_info.get('alias_ids', set())) & self._orders_placed_this_iteration
             ]
@@ -1090,14 +1162,22 @@ class PerpGridStrategy(PerpetualMarketMaker):
         # 處理已成交的平倉單
         if filled_close_orders:
             logger.info("檢測到 %d 個平倉單已成交（不在交易所活躍訂單中）", len(filled_close_orders))
-            for order_id, close_info in filled_close_orders:
+            for order_id, close_info, venue_total in filled_close_orders:
                 open_price = close_info.get('open_price', 0)
-                quantity = close_info.get('quantity', 0)
+                original = float(close_info.get('quantity', 0) or 0)
+                tracked = float(close_info.get('filled_quantity', 0) or 0)
+                quantity = max(0.0, min(original, venue_total) - tracked)
                 position_type = close_info.get('position_type', 'long')
                 side = 'Ask' if position_type == 'long' else 'Bid'
                 logger.info("處理平倉單成交: ID=%s, 開倉價格=%.4f, 類型=%s", 
                            order_id, open_price, position_type)
-                self._handle_close_order_filled(order_id, open_price, side, quantity)
+                if quantity > 0:
+                    self._handle_close_order_filled(order_id, open_price, side, quantity)
+                remaining = max(0.0, original - venue_total)
+                if remaining > max(1e-12, self.min_order_size * 0.01) and order_id in self.close_orders:
+                    retry_count = close_info.get('retry_count', 0)
+                    self._remove_close_order(order_id, preserve_position=True)
+                    self._add_pending_close_order(open_price, remaining, position_type, retry_count)
         
         # 處理被取消的平倉單（重新掛單）
         if cancelled_close_orders:
@@ -1109,13 +1189,13 @@ class PerpGridStrategy(PerpetualMarketMaker):
                 retry_count = close_info.get('retry_count', 0)
                 
                 # 移除舊的平倉單記錄
-                self._remove_close_order(order_id)
+                self._remove_close_order(order_id, preserve_position=True)
                 
                 logger.info("重新掛平倉單: 開倉價格=%.4f, 數量=%.4f, 類型=%s, 重試次數=%d", 
                            open_price, quantity, position_type, retry_count + 1)
                 
                 # 加入待重試隊列
-                self._add_pending_close_order(open_price, quantity, position_type, retry_count + 1)
+                self._add_pending_close_order(open_price, quantity, position_type, retry_count)
 
     def _verify_order_filled(self, order_id: str, close_info: dict, 
                               fill_history: Optional[List] = None) -> bool:
@@ -1129,41 +1209,8 @@ class PerpGridStrategy(PerpetualMarketMaker):
         Returns:
             True 如果訂單確實成交了，False 如果訂單被取消
         """
-        try:
-            # 如果未提供成交歷史，則請求
-            if fill_history is None:
-                fills_response = self.client.get_fill_history(self.symbol, limit=50)
-                if not fills_response.success:
-                    logger.warning("無法獲取成交歷史，假設訂單已成交: %s", fills_response.error_message)
-                    return True  # 無法確認時，假設成交（保守處理）
-                fills = fills_response.data or []
-            else:
-                fills = fill_history
-            
-            # 收集該訂單的所有別名
-            order_aliases = {self._normalize_order_id(order_id)}
-            alias_set = close_info.get('alias_ids', set()) if isinstance(close_info, dict) else set()
-            for alias in alias_set:
-                normalized = self._normalize_order_id(alias)
-                if normalized:
-                    order_aliases.add(normalized)
-            
-            # 在成交歷史中查找匹配的訂單
-            for fill in fills:
-                fill_order_id = getattr(fill, 'order_id', None)
-                if fill_order_id:
-                    normalized_fill_id = self._normalize_order_id(fill_order_id)
-                    if normalized_fill_id in order_aliases:
-                        logger.debug("在成交歷史中找到訂單 %s 的成交記錄", order_id)
-                        return True
-            
-            # 沒有找到成交記錄，訂單可能被取消
-            logger.warning("訂單 %s 不在活躍列表中，也沒有成交記錄，判斷為被取消", order_id)
-            return False
-            
-        except Exception as e:
-            logger.error("驗證訂單成交狀態時發生錯誤: %s，假設已成交", e)
-            return True  # 發生錯誤時，假設成交（保守處理）
+        total = self._matching_fill_quantity(order_id, close_info, fill_history)
+        return total is not None and total > 0
 
     def _verify_open_order_filled(self, order_id: str, order_info: dict, 
                                    fill_history: Optional[List] = None) -> bool:
@@ -1179,42 +1226,55 @@ class PerpGridStrategy(PerpetualMarketMaker):
         Returns:
             True 如果訂單確實成交了，False 如果訂單被取消
         """
+        total = self._matching_fill_quantity(order_id, order_info, fill_history)
+        return total is not None and total > 0
+
+    def _matching_fill_quantity(
+        self,
+        order_id: str,
+        order_info: Dict[str, Any],
+        fill_history: Optional[List] = None,
+    ) -> Optional[float]:
+        """Return venue-confirmed cumulative fill quantity for an order.
+
+        ``None`` means the history request itself failed and the order must
+        remain unresolved. ``0`` is an authoritative no-fill result. Matching
+        includes the exchange oid and the bot cloid aliases.
+        """
         try:
-            # 如果未提供成交歷史，則請求
             if fill_history is None:
-                fills_response = self.client.get_fill_history(self.symbol, limit=50)
-                if not fills_response.success:
-                    logger.warning("無法獲取成交歷史，假設開倉單已成交: %s", fills_response.error_message)
-                    return True  # 無法確認時，假設成交（保守處理）
-                fills = fills_response.data or []
+                response = self.client.get_fill_history(self.symbol, limit=200)
+                if not response.success:
+                    logger.warning(
+                        "無法獲取成交歷史，訂單 %s 保持未決: %s",
+                        order_id,
+                        response.error_message,
+                    )
+                    return None
+                fills = response.data or []
             else:
                 fills = fill_history
-            
-            # 收集該訂單的所有別名
-            order_aliases = {self._normalize_order_id(order_id)}
-            if isinstance(order_info, dict):
-                alias_set = order_info.get('alias_ids', set())
-                for alias in alias_set:
-                    normalized = self._normalize_order_id(alias)
-                    if normalized:
-                        order_aliases.add(normalized)
-            
-            # 在成交歷史中查找匹配的訂單
+
+            aliases = self._collect_aliases(order_id, order_info)
+            total = 0.0
             for fill in fills:
                 fill_order_id = getattr(fill, 'order_id', None)
-                if fill_order_id:
-                    normalized_fill_id = self._normalize_order_id(fill_order_id)
-                    if normalized_fill_id in order_aliases:
-                        logger.debug("在成交歷史中找到開倉單 %s 的成交記錄", order_id)
-                        return True
-            
-            # 沒有找到成交記錄，訂單可能被取消
-            logger.warning("開倉單 %s 不在活躍列表中，也沒有成交記錄，判斷為被取消", order_id)
-            return False
-            
-        except Exception as e:
-            logger.error("驗證開倉單成交狀態時發生錯誤: %s，假設已成交", e)
-            return True  # 發生錯誤時，假設成交（保守處理）
+                raw = getattr(fill, 'raw', None)
+                fill_cloid = raw.get('cloid') if isinstance(raw, dict) else None
+                identifiers = {
+                    self._normalize_order_id(fill_order_id),
+                    self._normalize_order_id(fill_cloid),
+                }
+                if aliases.isdisjoint({value for value in identifiers if value}):
+                    continue
+                size = getattr(fill, 'size', None)
+                if size is None and isinstance(fill, dict):
+                    size = fill.get('size', fill.get('quantity', 0))
+                total += max(0.0, float(size or 0))
+            return total
+        except Exception as exc:
+            logger.error("累計訂單 %s 成交量時出錯，保持未決: %s", order_id, exc)
+            return None
 
     def _initialize_grid_prices(self) -> bool:
         """初始化網格價格點位"""
@@ -1288,6 +1348,22 @@ class PerpGridStrategy(PerpetualMarketMaker):
 
         # 去重並排序
         self.grid_levels = sorted(list(set(self.grid_levels)))
+
+        # 部分交易所（Hyperliquid）除 tick size 外還限制有效數字，且
+        # 買價/賣價的取整方向不同。內部網格也保存交易所 canonical
+        # price，避免下一輪把已存在的訂單誤判為缺單並重複掛出。
+        normalize_price = getattr(self.client, 'normalize_price', None)
+        if callable(normalize_price):
+            canonical_levels = []
+            for price in self.grid_levels:
+                if self.grid_type == 'long':
+                    is_buy = True
+                elif self.grid_type == 'short':
+                    is_buy = False
+                else:
+                    is_buy = price < current_price
+                canonical_levels.append(float(normalize_price(self.symbol, price, is_buy=is_buy)))
+            self.grid_levels = sorted(set(canonical_levels))
 
         logger.info("網格價格點位初始化完成，共 %d 個點位:", len(self.grid_levels))
         for i, price in enumerate(self.grid_levels):
@@ -1496,6 +1572,10 @@ class PerpGridStrategy(PerpetualMarketMaker):
         # 計算待重試平倉單的總數量
         pending_qty = sum(qty for _, qty, _, _ in self.pending_close_orders)
         total_close_order_qty += pending_qty
+
+        # Dust held until the venue's minimum notional is reached is already
+        # covered; excluding it would make position sync submit duplicates.
+        total_close_order_qty += sum(self.pending_close_requests.values())
         
         if net_position < 0:
             # 空頭倉位
@@ -1528,14 +1608,17 @@ class PerpGridStrategy(PerpetualMarketMaker):
 
     def _use_reduce_only_for_close(self) -> bool:
         """判斷是否應使用 reduce_only 掛平倉單。"""
-        # 中性網格一律不使用 reduce_only；單邊網格一律使用
-        return self.grid_type != "neutral"
+        # Hyperliquid 是單向淨持倉模型。即使是中性網格，平倉腿也必須
+        # reduce-only，否則行情跳空或事件延遲時可能反向開出新倉位。
+        return self.exchange == "hyperliquid" or self.grid_type != "neutral"
 
     def _requires_fill_verification(self) -> bool:
         """需要用成交歷史驗證訂單是否成交的交易所。"""
+        if self.exchange == 'hyperliquid':
+            return True
         if self.ws and self.ws.is_connected():
             return False
-        return self.exchange in ('paradex', 'aster', 'standx') or is_lighter_exchange(self.exchange)
+        return self.exchange in ('paradex', 'aster', 'standx', 'hyperliquid') or is_lighter_exchange(self.exchange)
 
     def _place_sync_close_orders(self, uncovered_qty: float, position_type: str, effective_min_size: float = None) -> None:
         """為未覆蓋的倉位補掛平倉單
@@ -1898,7 +1981,7 @@ class PerpGridStrategy(PerpetualMarketMaker):
 
     def _handle_close_order_cancel(self, order_id: str) -> None:
         """處理平倉單被取消"""
-        close_info = self._remove_close_order(order_id)
+        close_info = self._remove_close_order(order_id, preserve_position=True)
         if not close_info:
             return
 
@@ -2020,7 +2103,7 @@ class PerpGridStrategy(PerpetualMarketMaker):
         )
 
         should_try_reduce_only = self._use_reduce_only_for_close()
-        if should_try_reduce_only and self.exchange in ('backpack', 'aster', 'paradex'):
+        if should_try_reduce_only and self.exchange in ('backpack', 'aster', 'paradex', 'hyperliquid'):
             conflict_side = 'Ask' if is_long else 'Bid'
             self._cancel_conflicting_open_order_at_price(next_price, conflict_side)
 
@@ -2141,6 +2224,17 @@ class PerpGridStrategy(PerpetualMarketMaker):
             logger.warning(
                 "待重試平倉單數量 %.8f 小於最小訂單量 %.8f，跳過",
                 quantity, self.min_order_size
+            )
+            return
+
+        # Retrying cannot make an under-notional order valid. Return it to the
+        # per-grid accumulator until later fills make a valid close quantity.
+        min_notional = float(getattr(self.client, 'min_order_notional', 0) or 0)
+        if min_notional > 0 and quantity * open_price < min_notional:
+            self._queue_close_request(open_price, quantity, position_type)
+            logger.info(
+                "待平倉量 %.8f 名義價值 %.4f %s 小於交易所最低要求 %.2f，轉回暫存等待累積",
+                quantity, quantity * open_price, self.quote_asset, min_notional
             )
             return
         
@@ -2436,6 +2530,25 @@ class PerpGridStrategy(PerpetualMarketMaker):
             'Ask': dict(short_open_counts),
         }
 
+    @staticmethod
+    def _opening_order_quantities(open_orders: List[Any]) -> Tuple[float, float]:
+        """Return non-reduce-only resting buy and sell quantities."""
+        buy_qty = 0.0
+        sell_qty = 0.0
+        for order in open_orders:
+            if getattr(order, 'reduce_only', False):
+                continue
+            raw_qty = getattr(order, 'remaining_size', None)
+            if raw_qty is None:
+                raw_qty = getattr(order, 'size', 0)
+            qty = max(0.0, float(raw_qty or 0))
+            side = str(getattr(order, 'side', '') or '').upper()
+            if side in ('BUY', 'BID', 'LONG'):
+                buy_qty += qty
+            elif side in ('SELL', 'ASK', 'SHORT'):
+                sell_qty += qty
+        return buy_qty, sell_qty
+
     def _refill_grid_orders(self, current_price: Optional[float] = None,
                             open_orders: Optional[List] = None,
                             skip_fill_detection: bool = False) -> None:
@@ -2479,6 +2592,8 @@ class PerpGridStrategy(PerpetualMarketMaker):
         net_position = self.get_net_position()
         logger.debug("當前淨持倉: %.4f, 開始檢查網格訂單...", net_position)
 
+        opening_buy_qty, opening_sell_qty = self._opening_order_quantities(open_orders)
+
         # 有待重試的平倉單時，對應開倉價格視為鎖定，避免補開新倉
         pending_close_prices = {open_price for open_price, _, _, _ in self.pending_close_orders}
 
@@ -2486,6 +2601,7 @@ class PerpGridStrategy(PerpetualMarketMaker):
         skipped_locked = 0
         skipped_has_order = 0
         skipped_price_offset = 0  # 因價格偏移跳過的點位
+        skipped_risk_limit = 0
         
         # 追蹤本次迭代已補單的價格，避免重複補單
         filled_prices_this_round: Set[float] = set()
@@ -2516,7 +2632,8 @@ class PerpGridStrategy(PerpetualMarketMaker):
             return None
 
         def try_place(target_price: float, side: str) -> None:
-            nonlocal refilled, skipped_locked, skipped_has_order, skipped_price_offset, skipped_out_of_range
+            nonlocal refilled, skipped_locked, skipped_has_order, skipped_price_offset
+            nonlocal skipped_out_of_range, skipped_risk_limit, opening_buy_qty, opening_sell_qty
 
             # 範圍檢查
             if side == 'Bid' and price_out_of_range_low:
@@ -2590,6 +2707,25 @@ class PerpGridStrategy(PerpetualMarketMaker):
                 skipped_locked += 1
                 return
 
+            # Mirror the Hyperliquid adapter's worst-case exposure check before
+            # sending a request. This avoids retrying the same impossible grid
+            # order every iteration while all resting orders remain unchanged.
+            if self.exchange == 'hyperliquid' and self.max_position > 0:
+                projected_long = net_position + opening_buy_qty + (self.order_quantity if side == 'Bid' else 0)
+                projected_short = net_position - opening_sell_qty - (self.order_quantity if side == 'Ask' else 0)
+                exceeds_limit = (
+                    projected_long > self.max_position + 1e-12
+                    or projected_short < -self.max_position - 1e-12
+                )
+                if exceeds_limit:
+                    logger.debug(
+                        "網格點位 %.4f 因最壞敞口限制跳過%s單 (long=%.8f, short=%.8f, max=%.8f)",
+                        target_price, "開多" if side == 'Bid' else "開空",
+                        projected_long, projected_short, self.max_position,
+                    )
+                    skipped_risk_limit += 1
+                    return
+
             logger.info(
                 "補充%s單: 價格=%.4f, 數量=%.4f",
                 "開多" if side == 'Bid' else "開空",
@@ -2600,6 +2736,10 @@ class PerpGridStrategy(PerpetualMarketMaker):
             if placed:
                 refilled += 1
                 filled_prices_this_round.add(target_price)
+                if side == 'Bid':
+                    opening_buy_qty += self.order_quantity
+                else:
+                    opening_sell_qty += self.order_quantity
 
         for price in self.grid_levels:
             side = decide_side(price)
@@ -2622,6 +2762,8 @@ class PerpGridStrategy(PerpetualMarketMaker):
                 log_parts.append(f"跳過 {skipped_price_offset} 個價格偏移點位")
             if skipped_out_of_range > 0:
                 log_parts.append(f"跳過 {skipped_out_of_range} 個超出範圍點位 (當前價格: {current_price:.4f}, 範圍: {self.grid_lower_price:.4f}~{self.grid_upper_price:.4f})")
+            if skipped_risk_limit > 0:
+                log_parts.append(f"跳過 {skipped_risk_limit} 個最壞敞口超限點位")
             log_parts.append(f"(總開倉單: {total_open_orders}, 總平倉單: {len(self.close_orders)})")
             
             logger.info(", ".join(log_parts))
