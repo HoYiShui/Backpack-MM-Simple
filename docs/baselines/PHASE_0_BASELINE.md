@@ -4,7 +4,7 @@
 >
 > 代码锚点：`2cf68d6 feat: add terminal trading dashboard`
 >
-> 计划 tag：`pre-refactor-multiexchange-2026-08-19`
+> 基线 tag：`pre-refactor-multiexchange-2026-08-19`
 >
 > 目的：冻结当前已经可用的交易行为，为后续渐进改造提供回退点和比较基准
 
@@ -214,3 +214,17 @@ Artifact：[`artifacts/hyperliquid-testnet-1787044794608.json`](../../artifacts/
 - 工作区干净；
 - 没有交易逻辑变更；
 - 用户收到 tag、commit、测试和 artifact 摘要，并决定是否接受。
+
+## 9. 阶段 0 执行记录
+
+| 项目 | 结果 |
+|---|---|
+| 状态 | `READY_FOR_REVIEW` |
+| 代码基线 | `2cf68d6` |
+| 基线 tag | `pre-refactor-multiexchange-2026-08-19` |
+| 路线图与基线文档提交 | `5e2776a` |
+| 自动化测试 | `38 passed` |
+| 真实交易 | 本阶段未产生新订单；复用 2026-08-18 的两份 Testnet artifact |
+| 交易逻辑变更 | 无 |
+
+阶段 0 尚未标记为 `ACCEPTED`。用户检查上述证据并明确通过后，才能关闭阶段 0 Goal；进入阶段 1 需要单独授权。

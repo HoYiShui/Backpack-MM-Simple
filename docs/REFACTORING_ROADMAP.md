@@ -1,6 +1,6 @@
 # Backpack-MM-Simple 改造路线图
 
-> 状态：执行中（阶段 0）
+> 状态：阶段 0 等待验收
 >
 > 产品定位：个人使用、Hyperliquid-first、Backpack-supported
 >
@@ -582,7 +582,7 @@ Presentation → RuntimeController → Strategy → Exchange interface
 
 | 阶段 | 状态 | Goal/提交 | 验收备注 |
 |---:|---|---|---|
-| 0 | IN_PROGRESS | 阶段 0 Goal 已创建 | 建立代码、测试、Testnet 证据与不可变行为基线 |
+| 0 | READY_FOR_REVIEW | `2cf68d6` / `pre-refactor-multiexchange-2026-08-19` / `5e2776a` | `38 passed`；复用两份既有 Testnet artifact；无交易逻辑变更 |
 | 1 | PLANNED | — | — |
 | 2 | PLANNED | — | — |
 | 3 | PLANNED | — | — |
