@@ -19,6 +19,8 @@
 
 Twitter：[Yan Practice ⭕散修](https://x.com/practice_y11)
 
+本 fork 的后续方向是个人使用、Hyperliquid-first、Backpack-supported。分阶段改造目标和每阶段验收标准见 [改造路线图](docs/REFACTORING_ROADMAP.md)。
+
 ## 功能特點
 
 - **Web 控制枱**：直觀的圖形化界面，實時監控交易狀態和策略表現
